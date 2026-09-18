@@ -132,7 +132,7 @@ export async function importExperimentArtifactForDemo(input: {
     const run = await tx.experimentRun.create({
       data: {
         experimentId: experiment.id,
-        environmentReportId: input.artifact.environmentReportId,
+        environmentReportId: input.artifact.environmentReportId ?? null,
         status: input.artifact.runs.some((r) => r.status === "failed") ? "partial" : "complete",
         completedAt: new Date(),
       },
@@ -146,9 +146,9 @@ export async function importExperimentArtifactForDemo(input: {
           status: metric.status,
           peakAllocatedBytes: metric.peakAllocatedBytes == null ? null : BigInt(metric.peakAllocatedBytes),
           peakReservedBytes: metric.peakReservedBytes == null ? null : BigInt(metric.peakReservedBytes),
-          tokensPerSecond: metric.tokensPerSecond,
-          stepSeconds: metric.stepSeconds,
-          failureCode: metric.failureCode,
+          tokensPerSecond: metric.tokensPerSecond ?? null,
+          stepSeconds: metric.stepSeconds ?? null,
+          failureCode: metric.failureCode ?? null,
         },
       });
     }
@@ -163,7 +163,7 @@ export async function importExperimentArtifactForDemo(input: {
         mediaType: "application/json",
         artifactType: "attention_memory_scaling_result",
         visibility: "private",
-        metadataJson: input.artifact,
+        metadataJson: JSON.parse(JSON.stringify(input.artifact)),
       },
     });
 
@@ -217,7 +217,7 @@ export async function finalizeInterpretationForDemo(input: {
         observation: input.observation,
         interpretation: input.interpretation,
         uncertainty: input.uncertainty,
-        nextExperiment: input.nextExperiment,
+        nextExperiment: input.nextExperiment ?? null,
         conclusion: input.conclusion,
         finalizedAt: new Date(),
       },
