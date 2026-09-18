@@ -1,0 +1,22 @@
+{
+  "name": "@fpllm/content",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "exports": {".": "./src/index.ts"},
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "validate": "tsx src/validate.ts ../../course"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "@types/node": "^24.3.0"
+  }
+}

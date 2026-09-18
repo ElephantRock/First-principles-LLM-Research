@@ -1,0 +1,9 @@
+readings:
+  - id: attention-is-all-you-need
+    title: Attention Is All You Need
+    purpose: Understand scaled dot-product attention and causal masking foundations.
+    requiredSections: ["3.2"]
+  - id: gqa-paper
+    title: "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints"
+    purpose: Understand query-head grouping and key/value sharing.
+    requiredSections: ["abstract", "method"]

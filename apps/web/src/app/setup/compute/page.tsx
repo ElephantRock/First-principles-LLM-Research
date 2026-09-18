@@ -1,0 +1,5 @@
+import Link from "next/link";
+import { Badge, Card } from "@fpllm/ui";
+import { getLearnerSnapshot } from "@/lib/persistence";
+export const dynamic="force-dynamic";
+export default async function ComputeSetupPage(){const snap=await getLearnerSnapshot();const p=snap.compute;return <><header className="page-header"><p className="eyebrow">Technical onboarding</p><h1>Compute profile</h1><p>The latest persisted environment evidence determines this operational view.</p></header><Card className="emphasis"><p className="eyebrow">Selected execution profile</p><h2>{p?.selectedProfile ?? "—"}</h2><div className="table-wrap"><table><tbody><tr><th>GPU</th><td>{p?.detectedGpu ?? "—"}</td></tr><tr><th>VRAM</th><td>{p?.vramGiB ?? "—"} GB</td></tr><tr><th>BF16</th><td>{p?.bf16Supported?"supported":"unavailable"}</td></tr><tr><th>Precision</th><td>{p?.precision ?? "—"}{p?.gradScaler?" + GradScaler":""}</td></tr></tbody></table></div><Link className="button primary" href="/home">Continue to dashboard</Link></Card></>}
