@@ -73,11 +73,15 @@ jobs:
             infra/docker/test-runtime/probe/protocol.py \
             infra/docker/test-runtime/probe/serve.py \
             infra/docker/test-runtime/probe/adapters/causal_attention_v1.py \
-            test-bundles/public/phase1-causal-attention@1.0/runner.py
+            test-bundles/public/phase1-causal-attention@1.0/runner.py \
+            scripts/ci/probe_memory_trace_client.py
           python -m unittest discover \
             -s infra/docker/test-runtime/tests \
             -p 'test_*.py' \
             -v
+
+      - name: Validate executable Causal Attention runtime image
+        run: bash scripts/ci/validate_causal_attention_runtime.sh
 
       - name: Typecheck
         run: pnpm typecheck
