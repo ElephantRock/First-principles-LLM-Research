@@ -4,7 +4,7 @@ import AxeBuilder from "@axe-core/playwright";
 test("vertical slice exposes the evidence loop", async ({ page }) => {
   await page.goto("/home");
   await expect(page.getByRole("heading", { name: "Continue the evidence loop." })).toBeVisible();
-  await page.getByRole("link", { name: "Run experiment" }).click();
+  await page.getByRole("link", { name: "Lock experiment" }).click();
   await expect(page.getByRole("heading", { name: "Attention Memory Scaling" })).toBeVisible();
 });
 
