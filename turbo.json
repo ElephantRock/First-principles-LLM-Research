@@ -1,5 +1,6 @@
 {
   "$schema": "https://turbo.build/schema.json",
+  "globalEnv": ["DATABASE_URL", "COURSE_CONTENT_ROOT", "FPLLM_DEMO_HANDLE"],
   "tasks": {
     "dev": { "cache": false, "persistent": true },
     "build": { "dependsOn": ["^build"], "outputs": [".next/**", "!.next/cache/**", "dist/**"] },
