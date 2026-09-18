@@ -1,9 +1,0 @@
-{
-  "name": "@fpllm/github",
-  "version": "0.2.0",
-  "private": true,
-  "type": "module",
-  "exports": {".": "./src/index.ts"},
-  "scripts": {"typecheck": "tsc --noEmit", "test": "tsc --noEmit", "lint": "tsc --noEmit"},
-  "devDependencies": {"@types/node": "^24.3.0", "typescript": "^5.9.2"}
-}
