@@ -43,7 +43,9 @@ export async function createVerifiedExperimentForDemo(submissionId: string) {
       WHERE "displayId" ~ '^E-[0-9]+$'
     `);
     const nextId = rows[0]?.nextId;
-    if (!Number.isSafeInteger(nextId) || nextId < 14) throw new Error("EXPERIMENT_DISPLAY_ID_ALLOCATION_FAILED");
+    if (typeof nextId !== "number" || !Number.isSafeInteger(nextId) || nextId < 14) {
+      throw new Error("EXPERIMENT_DISPLAY_ID_ALLOCATION_FAILED");
+    }
     const displayId = `E-${String(nextId).padStart(3, "0")}`;
 
     return tx.experiment.create({
