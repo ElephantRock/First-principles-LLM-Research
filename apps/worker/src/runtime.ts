@@ -3,10 +3,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import {
   assertSafeRepositoryRelativePath,
   assertSandboxJob,
-  buildDockerSandboxArgs,
+  buildHiddenEvaluatorSandboxArgs,
+  buildLearnerProbeSandboxArgs,
+  buildPublicTestSandboxArgs,
   type SandboxJob,
 } from "@fpllm/test-sandbox";
 
@@ -14,6 +17,7 @@ const MAX_REPOSITORY_ENTRIES = 10_000;
 const MAX_REPOSITORY_BYTES = 128 * 1024 * 1024;
 const DEFAULT_MAX_LOG_BYTES = 1024 * 1024;
 const DEFAULT_MAX_EVIDENCE_BYTES = 256 * 1024;
+const DEFAULT_PROBE_READY_TIMEOUT_MS = 10_000;
 const TEST_BUNDLE_ID = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/;
 
 const EXPECTED_INVARIANTS = {
@@ -79,12 +83,15 @@ export interface WorkerExecutionEvidence {
 }
 
 export interface WorkerRuntimeConfig {
+  publicTestBundleRoot: string;
   privateTestBundleRoot: string;
   dockerImage: string;
+  hiddenEvaluatorImage?: string;
   dockerBinary?: string;
   tempRoot?: string;
   maxLogBytes?: number;
   maxEvidenceBytes?: number;
+  probeReadyTimeoutMs?: number;
 }
 
 interface ProcessResult {
@@ -129,12 +136,16 @@ function containedPath(root: string, relativePath: string): string {
   return candidate;
 }
 
-export function resolvePrivateTestBundle(root: string, testBundleId: string): string {
+export function resolveVersionedTestBundle(root: string, testBundleId: string): string {
   if (!TEST_BUNDLE_ID.test(testBundleId)) throw new WorkerInfrastructureError("TEST_BUNDLE_ID_INVALID");
   const base = resolve(root);
   const candidate = resolve(base, testBundleId);
   if (!candidate.startsWith(`${base}${sep}`)) throw new WorkerInfrastructureError("TEST_BUNDLE_PATH_ESCAPE");
   return candidate;
+}
+
+export function resolvePrivateTestBundle(root: string, testBundleId: string): string {
+  return resolveVersionedTestBundle(root, testBundleId);
 }
 
 export async function materializeExactCommit(input: {
@@ -269,7 +280,7 @@ async function bestEffortDockerCommand(dockerBinary: string, args: readonly stri
   try {
     await runBoundedProcess({ executable: dockerBinary, args, timeoutSeconds: 15, maxCaptureBytes: 64 * 1024 });
   } catch {
-    // Cleanup failure is logged by the caller's surrounding infrastructure path.
+    // Cleanup is best-effort; primary execution errors are preserved by callers.
   }
 }
 
@@ -331,11 +342,17 @@ async function loadBundleResult(input: {
   return normalized;
 }
 
-async function runSandboxPhase(input: {
+async function requireBundleDirectory(path: string, errorCode: string): Promise<void> {
+  const bundle = await stat(path).catch(() => null);
+  if (!bundle?.isDirectory()) throw new WorkerInfrastructureError(errorCode);
+  const runner = await stat(join(path, "runner.py")).catch(() => null);
+  if (!runner?.isFile()) throw new WorkerInfrastructureError(`${errorCode}_RUNNER_MISSING`);
+}
+
+async function runPublicPhase(input: {
   job: SandboxJob;
-  visibility: TestVisibility;
   workspacePath: string;
-  privateBundlePath: string;
+  publicBundlePath: string;
   outputPath: string;
   dockerBinary: string;
   dockerImage: string;
@@ -344,30 +361,28 @@ async function runSandboxPhase(input: {
   stdoutHash: ReturnType<typeof createHash>;
   stderrHash: ReturnType<typeof createHash>;
 }): Promise<readonly WorkerInvariantResult[]> {
-  const containerName = `fpllm-${input.job.testRunId.replace(/[^A-Za-z0-9_.-]/g, "-")}-${input.visibility}-${randomUUID().slice(0, 8)}`;
-  const outputFileName = `${input.visibility}.json`;
-  const outputFilePath = join(input.outputPath, outputFileName);
+  const containerName = `fpllm-${input.job.testRunId.replace(/[^A-Za-z0-9_.-]/g, "-")}-public-${randomUUID().slice(0, 8)}`;
+  const outputFilePath = join(input.outputPath, "public.json");
   await rm(outputFilePath, { force: true });
 
-  const command = [
-    "python",
-    "/opt/fpllm/tests/runner.py",
-    "--bundle-id",
-    input.job.testBundleId,
-    "--visibility",
-    input.visibility,
-    "--output",
-    `/output/${outputFileName}`,
-  ];
-  const args = buildDockerSandboxArgs({
+  const args = buildPublicTestSandboxArgs({
     job: input.job,
     mounts: {
       workspaceHostPath: input.workspacePath,
-      hiddenTestsHostPath: input.privateBundlePath,
+      publicTestsHostPath: input.publicBundlePath,
       outputHostPath: input.outputPath,
     },
     image: input.dockerImage,
-    command,
+    command: [
+      "python",
+      "/opt/fpllm/tests/runner.py",
+      "--bundle-id",
+      input.job.testBundleId,
+      "--visibility",
+      "public",
+      "--output",
+      "/output/public.json",
+    ],
     containerName,
   });
 
@@ -384,18 +399,149 @@ async function runSandboxPhase(input: {
   });
   await bestEffortDockerCommand(input.dockerBinary, ["rm", "-f", containerName]);
 
-  if (result.timedOut) throw new WorkerInfrastructureError("SANDBOX_TIMEOUT");
+  if (result.timedOut) throw new WorkerInfrastructureError("PUBLIC_SANDBOX_TIMEOUT");
   if (result.exitCode !== 0) {
     const suffix = result.stderr.toString("utf8").slice(0, 500).replace(/[\r\n]+/g, " ");
-    throw new WorkerInfrastructureError("SANDBOX_RUNNER_FAILED", suffix ? `SANDBOX_RUNNER_FAILED: ${suffix}` : "SANDBOX_RUNNER_FAILED");
+    throw new WorkerInfrastructureError("PUBLIC_RUNNER_FAILED", suffix ? `PUBLIC_RUNNER_FAILED: ${suffix}` : "PUBLIC_RUNNER_FAILED");
   }
 
   return await loadBundleResult({
     filePath: outputFilePath,
-    visibility: input.visibility,
+    visibility: "public",
     testBundleId: input.job.testBundleId,
     maxEvidenceBytes: input.maxEvidenceBytes,
   });
+}
+
+async function waitForProbeReady(readyPath: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const marker = await stat(readyPath).catch(() => null);
+    if (marker?.isFile()) return;
+    await sleep(50);
+  }
+  throw new WorkerInfrastructureError("LEARNER_PROBE_NOT_READY");
+}
+
+async function runHiddenEvaluatorPhase(input: {
+  job: SandboxJob;
+  workspacePath: string;
+  privateBundlePath: string;
+  outputPath: string;
+  ipcPath: string;
+  dockerBinary: string;
+  learnerImage: string;
+  evaluatorImage: string;
+  maxLogBytes: number;
+  maxEvidenceBytes: number;
+  probeReadyTimeoutMs: number;
+  stdoutHash: ReturnType<typeof createHash>;
+  stderrHash: ReturnType<typeof createHash>;
+}): Promise<readonly WorkerInvariantResult[]> {
+  const suffix = randomUUID().slice(0, 8);
+  const safeRunId = input.job.testRunId.replace(/[^A-Za-z0-9_.-]/g, "-");
+  const probeContainer = `fpllm-${safeRunId}-probe-${suffix}`;
+  const evaluatorContainer = `fpllm-${safeRunId}-evaluator-${suffix}`;
+  const outputFilePath = join(input.outputPath, "hidden.json");
+  const readyPath = join(input.ipcPath, "probe.ready");
+  await rm(outputFilePath, { force: true });
+  await rm(readyPath, { force: true });
+
+  const probeArgs = buildLearnerProbeSandboxArgs({
+    job: input.job,
+    mounts: {
+      workspaceHostPath: input.workspacePath,
+      ipcHostPath: input.ipcPath,
+    },
+    image: input.learnerImage,
+    command: [
+      "python",
+      "/opt/fpllm/probe/serve.py",
+      "--socket",
+      "/run/fpllm-ipc/probe.sock",
+      "--ready-file",
+      "/run/fpllm-ipc/probe.ready",
+      "--interface",
+      "causal-attention-v1",
+    ],
+    containerName: probeContainer,
+    detach: true,
+  });
+
+  let probeStarted = false;
+  try {
+    const start = await runBoundedProcess({
+      executable: input.dockerBinary,
+      args: probeArgs,
+      timeoutSeconds: Math.min(30, input.job.execution.timeoutSeconds),
+      maxCaptureBytes: 64 * 1024,
+      onStderrChunk: (chunk) => input.stderrHash.update(chunk),
+    });
+    if (start.timedOut || start.exitCode !== 0) {
+      throw new WorkerInfrastructureError("LEARNER_PROBE_START_FAILED");
+    }
+    probeStarted = true;
+    await waitForProbeReady(readyPath, input.probeReadyTimeoutMs);
+
+    const evaluatorArgs = buildHiddenEvaluatorSandboxArgs({
+      job: input.job,
+      mounts: {
+        hiddenTestsHostPath: input.privateBundlePath,
+        ipcHostPath: input.ipcPath,
+        outputHostPath: input.outputPath,
+      },
+      image: input.evaluatorImage,
+      command: [
+        "python",
+        "/opt/fpllm/tests/runner.py",
+        "--bundle-id",
+        input.job.testBundleId,
+        "--visibility",
+        "hidden",
+        "--transport",
+        "unix",
+        "--socket",
+        "/run/fpllm-ipc/probe.sock",
+        "--output",
+        "/output/hidden.json",
+      ],
+      containerName: evaluatorContainer,
+    });
+
+    const evaluation = await runBoundedProcess({
+      executable: input.dockerBinary,
+      args: evaluatorArgs,
+      timeoutSeconds: input.job.execution.timeoutSeconds,
+      maxCaptureBytes: input.maxLogBytes,
+      onStdoutChunk: (chunk) => input.stdoutHash.update(chunk),
+      onStderrChunk: (chunk) => input.stderrHash.update(chunk),
+      onTimeout: async () => {
+        await Promise.all([
+          bestEffortDockerCommand(input.dockerBinary, ["kill", evaluatorContainer]),
+          bestEffortDockerCommand(input.dockerBinary, ["kill", probeContainer]),
+        ]);
+      },
+    });
+
+    if (evaluation.timedOut) throw new WorkerInfrastructureError("HIDDEN_EVALUATOR_TIMEOUT");
+    if (evaluation.exitCode !== 0) {
+      const stderr = evaluation.stderr.toString("utf8").slice(0, 500).replace(/[\r\n]+/g, " ");
+      throw new WorkerInfrastructureError(
+        "HIDDEN_EVALUATOR_FAILED",
+        stderr ? `HIDDEN_EVALUATOR_FAILED: ${stderr}` : "HIDDEN_EVALUATOR_FAILED",
+      );
+    }
+
+    return await loadBundleResult({
+      filePath: outputFilePath,
+      visibility: "hidden",
+      testBundleId: input.job.testBundleId,
+      maxEvidenceBytes: input.maxEvidenceBytes,
+    });
+  } finally {
+    await bestEffortDockerCommand(input.dockerBinary, ["rm", "-f", evaluatorContainer]);
+    if (probeStarted) await bestEffortDockerCommand(input.dockerBinary, ["rm", "-f", probeContainer]);
+  }
 }
 
 export async function executeSubmissionTest(input: {
@@ -409,8 +555,12 @@ export async function executeSubmissionTest(input: {
   const dockerBinary = input.config.dockerBinary ?? "docker";
   const maxLogBytes = input.config.maxLogBytes ?? DEFAULT_MAX_LOG_BYTES;
   const maxEvidenceBytes = input.config.maxEvidenceBytes ?? DEFAULT_MAX_EVIDENCE_BYTES;
+  const probeReadyTimeoutMs = input.config.probeReadyTimeoutMs ?? DEFAULT_PROBE_READY_TIMEOUT_MS;
   if (!Number.isInteger(maxEvidenceBytes) || maxEvidenceBytes < 4096 || maxEvidenceBytes > 2 * 1024 * 1024) {
     throw new WorkerInfrastructureError("EVIDENCE_SIZE_LIMIT_INVALID");
+  }
+  if (!Number.isInteger(probeReadyTimeoutMs) || probeReadyTimeoutMs < 250 || probeReadyTimeoutMs > 60_000) {
+    throw new WorkerInfrastructureError("PROBE_READY_TIMEOUT_INVALID");
   }
 
   const executionId = randomUUID();
@@ -418,27 +568,32 @@ export async function executeSubmissionTest(input: {
   const root = await mkdtemp(join(input.config.tempRoot ?? tmpdir(), "fpllm-worker-"));
   const workspacePath = join(root, "workspace");
   const outputPath = join(root, "output");
-  const privateBundlePath = resolvePrivateTestBundle(input.config.privateTestBundleRoot, job.testBundleId);
+  const ipcPath = join(root, "ipc");
+  const publicBundlePath = resolveVersionedTestBundle(input.config.publicTestBundleRoot, job.testBundleId);
+  const privateBundlePath = resolveVersionedTestBundle(input.config.privateTestBundleRoot, job.testBundleId);
   const stdoutHash = createHash("sha256");
   const stderrHash = createHash("sha256");
 
   try {
-    const bundle = await stat(privateBundlePath).catch(() => null);
-    if (!bundle?.isDirectory()) throw new WorkerInfrastructureError("PRIVATE_TEST_BUNDLE_NOT_FOUND");
+    await Promise.all([
+      requireBundleDirectory(publicBundlePath, "PUBLIC_TEST_BUNDLE_NOT_FOUND"),
+      requireBundleDirectory(privateBundlePath, "PRIVATE_TEST_BUNDLE_NOT_FOUND"),
+    ]);
 
     await mkdir(workspacePath, { recursive: true });
     await mkdir(outputPath, { recursive: true });
+    await mkdir(ipcPath, { recursive: true });
     await chmod(outputPath, 0o733);
+    await chmod(ipcPath, 0o733);
 
     await input.control.advance("preparing");
     await materializeExactCommit({ job, sourceClient: input.sourceClient, workspacePath });
 
     await input.control.advance("running_public");
-    const publicResults = await runSandboxPhase({
+    const publicResults = await runPublicPhase({
       job,
-      visibility: "public",
       workspacePath,
-      privateBundlePath,
+      publicBundlePath,
       outputPath,
       dockerBinary,
       dockerImage: input.config.dockerImage,
@@ -449,16 +604,18 @@ export async function executeSubmissionTest(input: {
     });
 
     await input.control.advance("running_hidden");
-    const hiddenResults = await runSandboxPhase({
+    const hiddenResults = await runHiddenEvaluatorPhase({
       job,
-      visibility: "hidden",
       workspacePath,
       privateBundlePath,
       outputPath,
+      ipcPath,
       dockerBinary,
-      dockerImage: input.config.dockerImage,
+      learnerImage: input.config.dockerImage,
+      evaluatorImage: input.config.hiddenEvaluatorImage ?? input.config.dockerImage,
       maxLogBytes,
       maxEvidenceBytes,
+      probeReadyTimeoutMs,
       stdoutHash,
       stderrHash,
     });
