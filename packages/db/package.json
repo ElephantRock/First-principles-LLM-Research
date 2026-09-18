@@ -3,13 +3,13 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "exports": {".": "./src/index.ts"},
+  "exports": { ".": "./src/index.ts" },
   "scripts": {
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",
     "typecheck": "prisma generate && tsc --noEmit",
-    "test": "prisma generate && tsc --noEmit",
+    "test": "prisma generate && tsx --test src/jobs.integration.test.ts",
     "lint": "prisma generate && tsc --noEmit"
   },
   "dependencies": {
