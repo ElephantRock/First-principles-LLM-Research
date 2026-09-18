@@ -1,8 +1,0 @@
-{
-  "name": "@fpllm/observability",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "exports": { ".": "./src/index.ts" },
-  "scripts": { "build": "tsc -p tsconfig.json", "typecheck": "tsc --noEmit -p tsconfig.json", "test": "echo 'no tests yet'", "lint": "tsc --noEmit -p tsconfig.json" }
-}
