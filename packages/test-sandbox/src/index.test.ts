@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildDockerSandboxArgs, type SandboxJob } from "@fpllm/test-sandbox";
+import {
+  assertSafeRepositoryRelativePath,
+  buildDockerSandboxArgs,
+  type SandboxJob,
+} from "@fpllm/test-sandbox";
 
 const job: SandboxJob = {
   schemaVersion: "1",
@@ -63,4 +67,13 @@ test("sandbox contract rejects network-enabled jobs", () => {
     }),
     /SANDBOX_NETWORK_MUST_BE_DISABLED/,
   );
+});
+
+test("repository materialization accepts ordinary relative paths and rejects traversal/control paths", () => {
+  assert.doesNotThrow(() => assertSafeRepositoryRelativePath("src/fpllm/model/attention.py"));
+  assert.throws(() => assertSafeRepositoryRelativePath("../hidden-tests/test_attention.py"), /REPOSITORY_PATH_UNSAFE/);
+  assert.throws(() => assertSafeRepositoryRelativePath("src/../../etc/passwd"), /REPOSITORY_PATH_UNSAFE/);
+  assert.throws(() => assertSafeRepositoryRelativePath("/etc/passwd"), /REPOSITORY_PATH_UNSAFE/);
+  assert.throws(() => assertSafeRepositoryRelativePath("src\\escape.py"), /REPOSITORY_PATH_UNSAFE/);
+  assert.throws(() => assertSafeRepositoryRelativePath("src/evil\nname.py"), /REPOSITORY_PATH_UNSAFE/);
 });
