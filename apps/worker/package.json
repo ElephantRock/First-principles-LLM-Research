@@ -11,7 +11,7 @@
     "start": "pnpm --dir ../../packages/db exec tsx ../../apps/worker/src/index.ts",
     "build": "tsc --noEmit -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "pnpm --dir ../../packages/db exec tsx --test ../../apps/worker/src/runtime.test.ts",
+    "test": "pnpm --dir ../../packages/db exec tsx --test ../../apps/worker/src/runtime.test.ts ../../apps/worker/src/runtime-db.integration.test.ts",
     "lint": "tsc --noEmit -p tsconfig.json"
   }
 }
