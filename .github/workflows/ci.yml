@@ -49,6 +49,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
+      - name: Capture bootstrap lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-pnpm-lock
+          path: pnpm-lock.yaml
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Generate Prisma client
         run: pnpm db:generate
 
