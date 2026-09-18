@@ -45,6 +45,7 @@ export interface SandboxMounts {
 
 const FULL_GIT_SHA = /^[0-9a-f]{40}$/i;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
+const CONTAINER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 export function assertSafeRepositoryRelativePath(path: string): void {
   if (!path || path.length > 4096) throw new Error("REPOSITORY_PATH_INVALID");
@@ -90,10 +91,14 @@ export function buildDockerSandboxArgs(input: {
   mounts: SandboxMounts;
   image: string;
   command: readonly string[];
+  containerName?: string;
 }): readonly string[] {
   assertSandboxJob(input.job);
   if (!input.image || input.image.includes("\n") || input.image.includes("\r")) throw new Error("SANDBOX_IMAGE_INVALID");
   if (input.command.length === 0) throw new Error("SANDBOX_COMMAND_REQUIRED");
+  if (input.containerName !== undefined && !CONTAINER_NAME.test(input.containerName)) {
+    throw new Error("SANDBOX_CONTAINER_NAME_INVALID");
+  }
 
   const workspace = safeMountPath(input.mounts.workspaceHostPath);
   const hiddenTests = safeMountPath(input.mounts.hiddenTestsHostPath);
@@ -103,6 +108,7 @@ export function buildDockerSandboxArgs(input: {
   return [
     "run",
     "--rm",
+    ...(input.containerName ? [`--name=${input.containerName}`] : []),
     "--network=none",
     "--read-only",
     "--cap-drop=ALL",
