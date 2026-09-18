@@ -3,6 +3,9 @@
   "test_bundle_id": "phase1-causal-attention@1.0",
   "lab_id": "phase1-causal-attention-lab",
   "lab_version": "1.0",
+  "adapter_interface": "causal-attention-v1",
+  "public_bundle_path": "test-bundles/public/phase1-causal-attention@1.0",
+  "runtime_contract": "docs/platform/CAUSAL_ATTENTION_ADAPTER_v1.md",
   "public_invariants": [
     "attention.shape",
     "attention.causal",
@@ -13,5 +16,5 @@
     "attention.randomized_numerics",
     "attention.no_permanent_kv_repeat"
   ],
-  "visibility_note": "This public contract enumerates documented invariants only. Hidden fixtures, seeds, randomized cases, and solution-sensitive assertions are not stored in this public repository."
+  "visibility_note": "This public contract enumerates documented invariants only. Hidden fixtures, seeds, randomized cases, evaluator logic, and solution-sensitive assertions are not stored in this public repository."
 }

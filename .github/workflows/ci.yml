@@ -47,6 +47,11 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -61,6 +66,18 @@ jobs:
 
       - name: Validate course content
         run: pnpm content:validate
+
+      - name: Validate probe protocol runtime
+        run: |
+          python -m py_compile \
+            infra/docker/test-runtime/probe/protocol.py \
+            infra/docker/test-runtime/probe/serve.py \
+            infra/docker/test-runtime/probe/adapters/causal_attention_v1.py \
+            test-bundles/public/phase1-causal-attention@1.0/runner.py
+          python -m unittest discover \
+            -s infra/docker/test-runtime/tests \
+            -p 'test_*.py' \
+            -v
 
       - name: Typecheck
         run: pnpm typecheck
