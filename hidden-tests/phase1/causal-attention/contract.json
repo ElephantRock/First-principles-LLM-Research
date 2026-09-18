@@ -4,8 +4,15 @@
   "lab_id": "phase1-causal-attention-lab",
   "lab_version": "1.0",
   "adapter_interface": "causal-attention-v1",
+  "adapter_memory_trace_schema": "2",
   "public_bundle_path": "test-bundles/public/phase1-causal-attention@1.0",
   "runtime_contract": "docs/platform/CAUSAL_ATTENTION_ADAPTER_v1.md",
+  "memory_trace_contract": "docs/platform/CAUSAL_ATTENTION_MEMORY_TRACE_v2.md",
+  "regression_fixtures": {
+    "known_good": "c29f8a28cb56d2b50d5139bae1a7747ddf495c89",
+    "known_bad_kv_repeat": "3ccf5ba08f37c5d35b56e66b9e78993eb117d93f",
+    "known_bad_no_rope": "636251fd92b7e81de63c40e767bef981ec9ca88a"
+  },
   "public_invariants": [
     "attention.shape",
     "attention.causal",
@@ -16,5 +23,5 @@
     "attention.randomized_numerics",
     "attention.no_permanent_kv_repeat"
   ],
-  "visibility_note": "This public contract enumerates documented invariants only. Hidden fixtures, seeds, randomized cases, evaluator logic, and solution-sensitive assertions are not stored in this public repository."
+  "visibility_note": "This public contract enumerates documented invariants and immutable regression fixture identities only. Hidden fixtures, seeds, randomized cases, evaluator logic, and solution-sensitive assertions are not stored in this public repository."
 }
