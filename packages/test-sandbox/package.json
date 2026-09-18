@@ -4,5 +4,10 @@
   "private": true,
   "type": "module",
   "exports": { ".": "./src/index.ts" },
-  "scripts": { "build": "tsc -p tsconfig.json", "typecheck": "tsc --noEmit -p tsconfig.json", "test": "echo 'no tests yet'", "lint": "tsc --noEmit -p tsconfig.json" }
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test src/index.test.ts",
+    "lint": "tsc --noEmit -p tsconfig.json"
+  }
 }
