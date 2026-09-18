@@ -7,13 +7,36 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
   const { id } = await context.params;
   const raw: unknown = await request.json();
   const parsed = experimentArtifactSchema.safeParse(raw);
-  if (!parsed.success) return NextResponse.json({ ok: false, code: "ARTIFACT_SCHEMA_INVALID", errors: parsed.error.flatten() }, { status: 400 });
+  if (!parsed.success) {
+    return NextResponse.json(
+      { ok: false, code: "ARTIFACT_SCHEMA_INVALID", errors: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
   const canonical = JSON.stringify(parsed.data);
   const sha256 = createHash("sha256").update(canonical).digest("hex");
+  const artifact = {
+    schemaVersion: parsed.data.schemaVersion,
+    experimentId: parsed.data.experimentId,
+    experimentType: parsed.data.experimentType,
+    submissionCommit: parsed.data.submissionCommit,
+    ...(parsed.data.environmentReportId === undefined ? {} : { environmentReportId: parsed.data.environmentReportId }),
+    runs: parsed.data.runs.map((run) => ({
+      sequenceLength: run.sequenceLength,
+      status: run.status,
+      ...(run.peakAllocatedBytes === undefined ? {} : { peakAllocatedBytes: run.peakAllocatedBytes }),
+      ...(run.peakReservedBytes === undefined ? {} : { peakReservedBytes: run.peakReservedBytes }),
+      ...(run.tokensPerSecond === undefined ? {} : { tokensPerSecond: run.tokensPerSecond }),
+      ...(run.stepSeconds === undefined ? {} : { stepSeconds: run.stepSeconds }),
+      ...(run.failureCode === undefined ? {} : { failureCode: run.failureCode }),
+    })),
+  };
+
   try {
     const result = await importExperimentArtifactForDemo({
       experimentDbId: id,
-      artifact: parsed.data,
+      artifact,
       sha256,
       byteSize: Buffer.byteLength(canonical),
     });
