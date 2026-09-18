@@ -6,8 +6,8 @@ import {
   leaseNextSubmissionTestJob,
   prisma,
   retrySubmissionTestJobAfterInfrastructureFailure,
-} from "@fpllm/db";
-import { GitHubAppClient } from "@fpllm/github";
+} from "../../../packages/db/src/index.ts";
+import { GitHubAppClient } from "../../../packages/github/src/index.ts";
 import { logEvent } from "@fpllm/observability";
 import {
   executeSubmissionTest,
@@ -60,7 +60,7 @@ async function processOneSubmissionTest(): Promise<boolean> {
   const leased = await leaseNextSubmissionTestJob({ workerId, leaseSeconds });
   if (!leased) return false;
 
-  logEvent("worker.job.leased", { submissionId: undefined }, {
+  logEvent("worker.job.leased", {}, {
     workerId,
     jobId: leased.id,
     testRunId: leased.testRunId,
