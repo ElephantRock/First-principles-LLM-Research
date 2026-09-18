@@ -65,20 +65,35 @@ test("private test bundle resolution rejects path escape attempts", () => {
   assert.throws(() => resolvePrivateTestBundle("/srv/fpllm/bundles", "../secrets"), /TEST_BUNDLE_ID_INVALID/);
 });
 
-test("worker executes public then hidden phases and returns normalized evidence", async () => {
+test("worker executes public tests then split hidden evaluator without co-mounting secrets", async () => {
   const root = await mkdtemp(join(tmpdir(), "fpllm-worker-runtime-test-"));
-  const bundleRoot = join(root, "bundles");
-  const bundlePath = join(bundleRoot, job.testBundleId);
+  const publicBundleRoot = join(root, "public-bundles");
+  const privateBundleRoot = join(root, "private-bundles");
+  const publicBundlePath = join(publicBundleRoot, job.testBundleId);
+  const privateBundlePath = join(privateBundleRoot, job.testBundleId);
   const scratch = join(root, "scratch");
   const fakeDocker = join(root, "fake-docker.mjs");
-  await mkdir(bundlePath, { recursive: true });
+  const callsLog = join(root, "docker-calls.jsonl");
+  await mkdir(publicBundlePath, { recursive: true });
+  await mkdir(privateBundlePath, { recursive: true });
   await mkdir(scratch, { recursive: true });
-  await writeFile(join(bundlePath, "runner.py"), "# private runner fixture\n");
+  await writeFile(join(publicBundlePath, "runner.py"), "# public runner fixture\n");
+  await writeFile(join(privateBundlePath, "runner.py"), "# private evaluator fixture\n");
   await writeFile(fakeDocker, `#!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
 const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(callsLog)}, JSON.stringify(args) + "\\n");
 if (args[0] === "kill" || args[0] === "rm") process.exit(0);
+if (args.includes("-d")) {
+  const ipcMount = args.find((value) => value.startsWith("--mount=type=bind,") && value.includes("target=/run/fpllm-ipc"));
+  if (!ipcMount) process.exit(84);
+  const match = ipcMount.match(/source=([^,]+),target=\\/run\\/fpllm-ipc/);
+  if (!match) process.exit(85);
+  fs.writeFileSync(path.join(match[1], "probe.ready"), "ready\\n");
+  console.log("fixture-probe-container");
+  process.exit(0);
+}
 const outputMount = args.find((value) => value.startsWith("--mount=type=bind,") && value.includes("target=/output"));
 if (!outputMount) process.exit(81);
 const match = outputMount.match(/source=([^,]+),target=\\/output/);
@@ -88,6 +103,7 @@ const bundleIndex = args.indexOf("--bundle-id");
 if (visibilityIndex < 0 || bundleIndex < 0) process.exit(83);
 const visibility = args[visibilityIndex + 1];
 const testBundleId = args[bundleIndex + 1];
+if (visibility === "hidden" && args.some((value) => value.includes("target=/workspace"))) process.exit(86);
 const ids = visibility === "public"
   ? ["attention.shape", "attention.causal", "attention.gqa_equivalence", "attention.gradients"]
   : ["attention.randomized_numerics", "attention.no_permanent_kv_repeat"];
@@ -108,10 +124,13 @@ console.log("completed:" + visibility);
         },
       },
       config: {
-        privateTestBundleRoot: bundleRoot,
+        publicTestBundleRoot: publicBundleRoot,
+        privateTestBundleRoot,
         dockerImage: "fpllm/test-runtime@sha256:" + "c".repeat(64),
+        hiddenEvaluatorImage: "fpllm/hidden-evaluator@sha256:" + "d".repeat(64),
         dockerBinary: fakeDocker,
         tempRoot: scratch,
+        probeReadyTimeoutMs: 2_000,
       },
     });
 
@@ -121,6 +140,17 @@ console.log("completed:" + visibility);
     assert.equal(evidence.results.every((result) => result.passed), true);
     assert.match(evidence.stdoutSha256, /^[0-9a-f]{64}$/);
     assert.match(evidence.stderrSha256, /^[0-9a-f]{64}$/);
+
+    const calls = (await readFile(callsLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
+    const probeCall = calls.find((args) => args.includes("-d"));
+    const hiddenCall = calls.find((args) => args.includes("hidden") && args.includes("--visibility"));
+    assert.ok(probeCall);
+    assert.ok(hiddenCall);
+    assert.equal(probeCall.some((arg) => arg.includes("/opt/fpllm/tests")), false);
+    assert.equal(probeCall.some((arg) => arg.includes(privateBundlePath)), false);
+    assert.equal(hiddenCall.some((arg) => arg.includes("target=/workspace")), false);
+    assert.equal(hiddenCall.some((arg) => arg.includes("workspace")), false);
+    assert.equal(hiddenCall.some((arg) => arg.includes(privateBundlePath)), true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
