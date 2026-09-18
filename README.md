@@ -1,11 +1,7 @@
 # First Principles LLM Research
 
-Build, Optimize, Scale, Post-Train, and Study Verifiable Agents.
+Canonical public repository for the First Principles LLM Research course and learning platform.
 
-This repository is the canonical source for the course, research tooling, and learning platform. The project is designed around one progression:
+Current bootstrap branch: `bootstrap/platform-v0.2`.
 
-**build → verify → measure → explain → research**
-
-## Current status
-
-The active bootstrap work is on `bootstrap/platform-v0.2` and is being reviewed in PR #1 before merging to `main`.
+The current pull request is materializing the Phase 1 implementation, versioned course content, platform specifications, persistence-backed evidence flow, and CI into the canonical repository.
