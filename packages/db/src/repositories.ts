@@ -25,47 +25,6 @@ export async function getDemoSnapshot() {
   return { user, compute, repository, submission, experiment, journal, mastery };
 }
 
-export async function createSubmissionForDemo(input: {
-  repositoryId: string;
-  branch: string;
-  commitSha: string;
-  labVersion: string;
-}) {
-  const user = await getDemoUser();
-  const courseVersion = await prisma.courseVersion.findFirst({ where: { courseId: "first-principles-llm-research", version: "1.0" } });
-  if (!courseVersion) throw new Error("Course version 1.0 is not seeded");
-  return prisma.submission.create({
-    data: {
-      userId: user.id,
-      repositoryId: input.repositoryId,
-      courseVersionId: courseVersion.id,
-      labId: "phase1-causal-attention-lab",
-      labVersion: input.labVersion,
-      branch: input.branch,
-      commitSha: input.commitSha,
-      state: "submitted",
-    },
-  });
-}
-
-export async function createExperimentForDemo(submissionId: string) {
-  const user = await getDemoUser();
-  const submission = await prisma.submission.findFirst({ where: { id: submissionId, userId: user.id } });
-  if (!submission) throw new Error("Submission not found");
-  const count = await prisma.experiment.count({ where: { userId: user.id } });
-  const displayId = `E-${String(count + 14).padStart(3, "0")}`;
-  return prisma.experiment.create({
-    data: {
-      displayId,
-      userId: user.id,
-      submissionId: submission.id,
-      experimentType: "attention_memory_scaling",
-      state: "draft",
-      commitSha: submission.commitSha,
-    },
-  });
-}
-
 export async function lockExperimentForDemo(input: { id: string; hypothesis: string; prediction: string }) {
   const user = await getDemoUser();
   return prisma.$transaction(async (tx) => {
