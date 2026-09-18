@@ -13,6 +13,7 @@ export const REQUIRED_MASTERY_DIMENSIONS = [
 ] as const;
 
 export type MasteryDimension = typeof REQUIRED_MASTERY_DIMENSIONS[number];
+export type CausalAttentionMasteryState = "mastered" | "awaiting_mastery";
 
 export function canonicalJsonSha256(value: unknown): string {
   const stable = JSON.stringify(value, Object.keys(value as Record<string, unknown>).sort());
@@ -39,9 +40,12 @@ export async function getCausalAttentionMastery(userId: string) {
   const dimensions = Object.fromEntries(
     REQUIRED_MASTERY_DIMENSIONS.map((dimension) => [dimension, passed.has(dimension) ? "passed" : "pending"]),
   ) as Record<MasteryDimension, "passed" | "pending">;
+  const overall: CausalAttentionMasteryState = REQUIRED_MASTERY_DIMENSIONS.every((dimension) => passed.has(dimension))
+    ? "mastered"
+    : "awaiting_mastery";
   return {
     ...dimensions,
-    overall: REQUIRED_MASTERY_DIMENSIONS.every((dimension) => passed.has(dimension)) ? "mastered" : "awaiting_mastery",
+    overall,
     evidence,
   };
 }
