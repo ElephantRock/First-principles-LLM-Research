@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assertSafeRepositoryRelativePath,
-  buildDockerSandboxArgs,
+  buildHiddenEvaluatorSandboxArgs,
+  buildLearnerProbeSandboxArgs,
+  buildPublicTestSandboxArgs,
   type SandboxJob,
 } from "@fpllm/test-sandbox";
 
@@ -28,16 +30,16 @@ const job: SandboxJob = {
   },
 };
 
-test("Docker sandbox arguments enforce the minimum isolation contract", () => {
-  const args = buildDockerSandboxArgs({
+test("public sandbox enforces the minimum isolation contract", () => {
+  const args = buildPublicTestSandboxArgs({
     job,
     mounts: {
       workspaceHostPath: "/srv/fpllm/workspace",
-      hiddenTestsHostPath: "/srv/fpllm/hidden-tests",
+      publicTestsHostPath: "/srv/fpllm/public-tests",
       outputHostPath: "/srv/fpllm/output",
     },
     image: "fpllm/test-runtime:dev",
-    command: ["python", "-m", "pytest", "/opt/fpllm/tests"],
+    command: ["python", "/opt/fpllm/tests/runner.py"],
     containerName: "fpllm-run-123",
   });
 
@@ -51,21 +53,57 @@ test("Docker sandbox arguments enforce the minimum isolation contract", () => {
   assert.ok(args.includes("--memory=4096m"));
   assert.ok(args.includes("--user=65532:65532"));
   assert.ok(args.includes("--mount=type=bind,source=/srv/fpllm/workspace,target=/workspace,readonly"));
-  assert.ok(args.includes("--mount=type=bind,source=/srv/fpllm/hidden-tests,target=/opt/fpllm/tests,readonly"));
+  assert.ok(args.includes("--mount=type=bind,source=/srv/fpllm/public-tests,target=/opt/fpllm/tests,readonly"));
   assert.equal(args.some((arg) => arg.includes("DOCKER_HOST")), false);
+});
+
+test("hidden evaluation structurally separates learner source from private tests", () => {
+  const probe = buildLearnerProbeSandboxArgs({
+    job,
+    mounts: { workspaceHostPath: "/srv/fpllm/workspace", ipcHostPath: "/srv/fpllm/ipc" },
+    image: "fpllm/test-runtime:dev",
+    command: ["python", "/opt/fpllm/probe/serve.py", "--socket", "/run/fpllm-ipc/probe.sock"],
+    containerName: "fpllm-probe-123",
+    detach: true,
+  });
+  const evaluator = buildHiddenEvaluatorSandboxArgs({
+    job,
+    mounts: {
+      hiddenTestsHostPath: "/srv/fpllm/private-tests",
+      ipcHostPath: "/srv/fpllm/ipc",
+      outputHostPath: "/srv/fpllm/output",
+    },
+    image: "fpllm/evaluator:dev",
+    command: ["python", "/opt/fpllm/tests/runner.py", "--socket", "/run/fpllm-ipc/probe.sock"],
+    containerName: "fpllm-evaluator-123",
+  });
+
+  assert.ok(probe.includes("-d"));
+  assert.ok(probe.some((arg) => arg.includes("target=/workspace,readonly")));
+  assert.equal(probe.some((arg) => arg.includes("/opt/fpllm/tests")), false);
+  assert.equal(probe.some((arg) => arg.includes("private-tests")), false);
+
+  assert.ok(evaluator.some((arg) => arg.includes("source=/srv/fpllm/private-tests,target=/opt/fpllm/tests,readonly")));
+  assert.equal(evaluator.some((arg) => arg.includes("target=/workspace")), false);
+  assert.equal(evaluator.some((arg) => arg.includes("/srv/fpllm/workspace")), false);
+
+  assert.ok(probe.some((arg) => arg.includes("target=/run/fpllm-ipc")));
+  assert.ok(evaluator.some((arg) => arg.includes("target=/run/fpllm-ipc")));
+  assert.ok(probe.includes("--network=none"));
+  assert.ok(evaluator.includes("--network=none"));
 });
 
 test("sandbox contract rejects network-enabled jobs", () => {
   assert.throws(
-    () => buildDockerSandboxArgs({
+    () => buildPublicTestSandboxArgs({
       job: { ...job, execution: { ...job.execution, networkEnabled: true as false } },
       mounts: {
         workspaceHostPath: "/srv/fpllm/workspace",
-        hiddenTestsHostPath: "/srv/fpllm/hidden-tests",
+        publicTestsHostPath: "/srv/fpllm/public-tests",
         outputHostPath: "/srv/fpllm/output",
       },
       image: "fpllm/test-runtime:dev",
-      command: ["python", "-m", "pytest"],
+      command: ["python", "/opt/fpllm/tests/runner.py"],
     }),
     /SANDBOX_NETWORK_MUST_BE_DISABLED/,
   );
@@ -73,15 +111,15 @@ test("sandbox contract rejects network-enabled jobs", () => {
 
 test("sandbox contract rejects unsafe container names", () => {
   assert.throws(
-    () => buildDockerSandboxArgs({
+    () => buildPublicTestSandboxArgs({
       job,
       mounts: {
         workspaceHostPath: "/srv/fpllm/workspace",
-        hiddenTestsHostPath: "/srv/fpllm/hidden-tests",
+        publicTestsHostPath: "/srv/fpllm/public-tests",
         outputHostPath: "/srv/fpllm/output",
       },
       image: "fpllm/test-runtime:dev",
-      command: ["python", "-m", "pytest"],
+      command: ["python", "/opt/fpllm/tests/runner.py"],
       containerName: "bad name;docker",
     }),
     /SANDBOX_CONTAINER_NAME_INVALID/,
