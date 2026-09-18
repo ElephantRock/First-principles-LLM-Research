@@ -284,23 +284,60 @@ def _flatten_shapes(value: Any) -> Iterable[list[int]]:
 
 
 class _HeadExpansionTrace:
+    """Record learner-visible KV materialization before attention matmul.
+
+    PyTorch may internally expand/clone a broadcast operand while lowering
+    matmul/bmm. Those backend temporaries are not evidence that learner code
+    permanently duplicated K/V. The stronger signal is a materialized grouped
+    KV tensor that is flattened back into an Hq-shaped learner-visible tensor
+    *before* the first attention bmm, or a direct materializing op that maps an
+    Hkv-shaped tensor to an Hq-shaped tensor before that bmm.
+    """
+
+    MATERIALIZING_TOKENS = ("repeat", "repeat_interleave", "clone", "index_select", "gather", "cat")
+
     def __init__(self, torch: Any, config: AttentionConfig):
         self.torch = torch
         self.config = config
         self.events: list[dict[str, Any]] = []
+        self.materialized_kv_events: list[dict[str, Any]] = []
         self._mode = None
+        self._seen_attention_bmm = False
+        self._pending_grouped_clone = False
 
-    def _is_head_expansion(self, before: list[int], after: list[int]) -> bool:
-        if len(before) != len(after) or len(before) < 3:
-            return False
-        for axis in (1, 2):
-            if axis >= len(before):
-                continue
-            if before[axis] != self.config.n_kv_heads or after[axis] != self.config.n_heads:
-                continue
-            if all(before[i] == after[i] for i in range(len(before)) if i != axis):
-                return True
-        return False
+    def _is_grouped_shape(self, shape: list[int]) -> bool:
+        return (
+            len(shape) == 5
+            and shape[1] == self.config.n_kv_heads
+            and shape[2] == self.config.group_size
+            and shape[-1] == self.config.head_dim
+        )
+
+    def _is_query_head_shape(self, shape: list[int]) -> bool:
+        return (
+            len(shape) == 4
+            and shape[1] == self.config.n_heads
+            and shape[-1] == self.config.head_dim
+        )
+
+    def _is_kv_head_shape(self, shape: list[int]) -> bool:
+        return (
+            len(shape) == 4
+            and shape[1] == self.config.n_kv_heads
+            and shape[-1] == self.config.head_dim
+        )
+
+    def _record(self, reason: str, func_name: str, before: list[list[int]], after: list[list[int]]) -> None:
+        if len(self.materialized_kv_events) >= 16:
+            return
+        event = {
+            "reason": reason,
+            "op": func_name[:160],
+            "inputShapes": before[:8],
+            "outputShapes": after[:8],
+        }
+        self.materialized_kv_events.append(event)
+        self.events.append(event)
 
     def __enter__(self) -> "_HeadExpansionTrace":
         try:
@@ -317,21 +354,39 @@ class _HeadExpansionTrace:
                 result = func(*args, **kwargs)
                 after = list(_flatten_shapes(result))
                 func_name = str(func)
-                interesting = any(
-                    token in func_name
-                    for token in ("repeat", "expand", "clone", "contiguous", "reshape", "view")
+
+                if owner._seen_attention_bmm:
+                    return result
+
+                if "aten.bmm" in func_name:
+                    owner._seen_attention_bmm = True
+                    owner._pending_grouped_clone = False
+                    return result
+
+                materializing = any(token in func_name for token in owner.MATERIALIZING_TOKENS)
+                if materializing and any(owner._is_grouped_shape(shape) for shape in after):
+                    owner._pending_grouped_clone = True
+
+                direct_kv_to_hq = (
+                    materializing
+                    and any(owner._is_kv_head_shape(shape) for shape in before)
+                    and any(owner._is_query_head_shape(shape) for shape in after)
                 )
-                changed_heads = any(
-                    owner._is_head_expansion(input_shape, output_shape)
-                    for input_shape in before
-                    for output_shape in after
+                if direct_kv_to_hq:
+                    owner._record("direct-materialized-kv-to-query-heads", func_name, before, after)
+                    owner._pending_grouped_clone = False
+                    return result
+
+                grouped_to_hq_view = (
+                    owner._pending_grouped_clone
+                    and ("view" in func_name or "reshape" in func_name)
+                    and any(owner._is_grouped_shape(shape) for shape in before)
+                    and any(owner._is_query_head_shape(shape) for shape in after)
                 )
-                if interesting and changed_heads and len(owner.events) < 128:
-                    owner.events.append({
-                        "op": func_name[:160],
-                        "inputShapes": before[:8],
-                        "outputShapes": after[:8],
-                    })
+                if grouped_to_hq_view:
+                    owner._record("materialized-grouped-kv-flattened-to-query-heads", func_name, before, after)
+                    owner._pending_grouped_clone = False
+
                 return result
 
         self._mode = Mode()
@@ -391,8 +446,10 @@ def _execute_forward(payload: dict[str, Any], *, trace_memory: bool) -> dict[str
         result["gradients"] = gradient_summary
     if trace_memory:
         result["memoryTrace"] = {
-            "schemaVersion": "1",
+            "schemaVersion": "2",
             "headExpansionEvents": trace.events,
+            "materializedKvExpansionEvents": trace.materialized_kv_events,
+            "decisionHint": "fail-if-materializedKvExpansionEvents-nonempty",
         }
     return result
 
