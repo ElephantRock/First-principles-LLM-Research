@@ -1,0 +1,43 @@
+{
+  "contentSha256": "ad89c6c8ee0cad733470bee3b0dea4e43209d22d97d0221b7ddbba60f8896e0c",
+  "courseId": "first-principles-llm-research",
+  "courseVersion": "1.0",
+  "files": [
+    {
+      "bytes": 211,
+      "path": "course/course.yaml",
+      "sha256": "71b659c1a98a03ceccdea999ea1b4da9a8777ce3397f9e5e258f12da8aed8541"
+    },
+    {
+      "bytes": 410,
+      "path": "course/phase1/causal-attention/experiment.yaml",
+      "sha256": "b51bc8bbcb10a9855b62dae11992254263de9955ec25d7322faaa0afc40e82eb"
+    },
+    {
+      "bytes": 531,
+      "path": "course/phase1/causal-attention/lab.yaml",
+      "sha256": "55196eb10131ee950578e874c5deb240db6c329528f3a713a27c5c3edd7494ca"
+    },
+    {
+      "bytes": 3295,
+      "path": "course/phase1/causal-attention/lesson.mdx",
+      "sha256": "6710c44ba7b012e95978cc1a5cf3cf78c640a0634674eab6dd51a7d6fa4088c2"
+    },
+    {
+      "bytes": 432,
+      "path": "course/phase1/causal-attention/mastery.yaml",
+      "sha256": "fe64628cf018c4c2394113c02985b79e0edf6ee061bc0f65c181dc3a82da295d"
+    },
+    {
+      "bytes": 424,
+      "path": "course/phase1/causal-attention/readings.yaml",
+      "sha256": "9f2c3c81e080e872f2ec5d6268e47452c8b3059b8bfbf17bbbb73ca5ce499a05"
+    },
+    {
+      "bytes": 761,
+      "path": "course/phase1/causal-attention/unit.yaml",
+      "sha256": "aa1134bc21504c2420f25ba8594d3672b9f6f0982d72f73d1a0dcbe8e3c8b5e1"
+    }
+  ],
+  "schemaVersion": "1"
+}

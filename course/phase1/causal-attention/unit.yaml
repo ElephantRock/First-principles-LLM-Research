@@ -1,0 +1,20 @@
+id: phase1-causal-attention
+phase: 1
+slug: causal-attention
+title: Causal Grouped-Query Attention
+version: "1.0"
+objective: Implement causal GQA from raw tensor operations and experimentally characterize its sequence-length memory scaling.
+estimatedActiveMinutes: 210
+prerequisites:
+  - phase1-lm-objective
+sections:
+  - { id: intuition, title: Intuition }
+  - { id: formalism, title: Formalism }
+  - { id: tensor-shapes, title: Tensor shapes }
+  - { id: causal-masking, title: Causal masking }
+  - { id: gqa-mechanics, title: GQA mechanics }
+  - { id: implementation-bridge, title: Implementation bridge }
+  - { id: failure-modes, title: Failure modes }
+  - { id: lab, title: Lab }
+  - { id: experiment, title: Experiment }
+  - { id: mastery, title: Mastery }

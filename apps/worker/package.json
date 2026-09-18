@@ -1,0 +1,11 @@
+{
+  "name": "@fpllm/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@fpllm/observability": "workspace:*",
+    "@fpllm/test-sandbox": "workspace:*"
+  },
+  "scripts": { "build": "tsc -p tsconfig.json", "typecheck": "tsc --noEmit -p tsconfig.json", "test": "echo 'worker execution intentionally not implemented in v0.1'", "lint": "tsc --noEmit -p tsconfig.json" }
+}

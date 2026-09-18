@@ -1,0 +1,24 @@
+{
+  "name": "first-principles-llm-research",
+  "private": true,
+  "version": "0.2.0",
+  "packageManager": "pnpm@10.17.1",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "typecheck": "turbo typecheck",
+    "test": "turbo test",
+    "lint": "turbo lint",
+    "content:validate": "pnpm --filter @fpllm/content validate",
+    "db:generate": "pnpm --filter @fpllm/db db:generate",
+    "db:migrate": "pnpm --filter @fpllm/db db:migrate",
+    "db:seed": "pnpm --filter @fpllm/db db:seed"
+  },
+  "devDependencies": {
+    "turbo": "^2.5.6",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=24 <25"
+  }
+}

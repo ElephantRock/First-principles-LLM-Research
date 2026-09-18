@@ -1,0 +1,15 @@
+id: attention-memory-scaling
+title: Attention Memory Scaling
+question: How does naïve attention memory grow with sequence length?
+sequenceLengths: [128, 256, 512, 1024]
+controlledVariables:
+  - model architecture
+  - batch size
+  - precision
+  - implementation commit
+  - measurement procedure
+requiredMetrics:
+  - peak_allocated_vram
+  - peak_reserved_vram
+  - tokens_per_second
+predictionMustBeLocked: true
