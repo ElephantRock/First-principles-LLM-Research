@@ -381,7 +381,6 @@ model MasteryState {
   status        String
   computedAt    DateTime    @default(now()) @db.Timestamptz(6)
   user          User        @relation(fields: [userId], references: [id], onDelete: Restrict)
-  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
   unitVersion   UnitVersion @relation(fields: [unitVersionId], references: [id], onDelete: Restrict)
 
   @@unique([userId, unitVersionId])
