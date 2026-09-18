@@ -34,9 +34,11 @@ export async function createVerifiedExperimentForDemo(submissionId: string) {
   if (!completePass) throw new Error("REQUIRED_TEST_EVIDENCE_INCOMPLETE");
 
   return prisma.$transaction(async (tx) => {
-    // Human-readable experiment IDs are allocated under a transaction-scoped
-    // advisory lock so concurrent verified submissions cannot claim the same ID.
-    await tx.$queryRawUnsafe("SELECT pg_advisory_xact_lock(734701320031)");
+    // Prisma cannot deserialize PostgreSQL's void return type directly. Cast the
+    // advisory-lock result to text while keeping acquisition transaction-scoped.
+    await tx.$queryRawUnsafe<Array<{ lockResult: string | null }>>(
+      'SELECT pg_advisory_xact_lock(734701320031)::text AS "lockResult"',
+    );
     const rows = await tx.$queryRawUnsafe<Array<{ nextId: number }>>(`
       SELECT COALESCE(MAX(SUBSTRING("displayId" FROM 3)::integer), 13) + 1 AS "nextId"
       FROM "Experiment"
