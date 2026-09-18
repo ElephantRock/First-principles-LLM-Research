@@ -37,9 +37,20 @@ export interface SandboxResult {
   stderrSha256?: string;
 }
 
-export interface SandboxMounts {
+export interface PublicTestMounts {
   workspaceHostPath: string;
+  publicTestsHostPath: string;
+  outputHostPath: string;
+}
+
+export interface LearnerProbeMounts {
+  workspaceHostPath: string;
+  ipcHostPath: string;
+}
+
+export interface HiddenEvaluatorMounts {
   hiddenTestsHostPath: string;
+  ipcHostPath: string;
   outputHostPath: string;
 }
 
@@ -79,36 +90,21 @@ function safeMountPath(path: string): string {
   return path;
 }
 
-/**
- * Build Docker CLI arguments for the v0.3 worker boundary.
- *
- * This function never invokes a shell and never receives platform secrets.
- * The worker is responsible for materializing the exact commit and hidden-test
- * bundle before calling the container runtime.
- */
-export function buildDockerSandboxArgs(input: {
-  job: SandboxJob;
-  mounts: SandboxMounts;
-  image: string;
-  command: readonly string[];
-  containerName?: string;
-}): readonly string[] {
-  assertSandboxJob(input.job);
+function validateContainerInput(input: { image: string; command: readonly string[]; containerName?: string }): void {
   if (!input.image || input.image.includes("\n") || input.image.includes("\r")) throw new Error("SANDBOX_IMAGE_INVALID");
   if (input.command.length === 0) throw new Error("SANDBOX_COMMAND_REQUIRED");
   if (input.containerName !== undefined && !CONTAINER_NAME.test(input.containerName)) {
     throw new Error("SANDBOX_CONTAINER_NAME_INVALID");
   }
+}
 
-  const workspace = safeMountPath(input.mounts.workspaceHostPath);
-  const hiddenTests = safeMountPath(input.mounts.hiddenTestsHostPath);
-  const output = safeMountPath(input.mounts.outputHostPath);
-  const limits = input.job.execution;
-
+function isolationArgs(job: SandboxJob, containerName?: string): string[] {
+  assertSandboxJob(job);
+  const limits = job.execution;
   return [
     "run",
     "--rm",
-    ...(input.containerName ? [`--name=${input.containerName}`] : []),
+    ...(containerName ? [`--name=${containerName}`] : []),
     "--network=none",
     "--read-only",
     "--cap-drop=ALL",
@@ -121,10 +117,81 @@ export function buildDockerSandboxArgs(input: {
     "--env=PYTHONHASHSEED=0",
     "--env=TMPDIR=/tmp",
     "--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=256m",
+  ];
+}
+
+/** Public test code may share a container with learner code because it contains no private fixtures. */
+export function buildPublicTestSandboxArgs(input: {
+  job: SandboxJob;
+  mounts: PublicTestMounts;
+  image: string;
+  command: readonly string[];
+  containerName?: string;
+}): readonly string[] {
+  validateContainerInput(input);
+  const workspace = safeMountPath(input.mounts.workspaceHostPath);
+  const publicTests = safeMountPath(input.mounts.publicTestsHostPath);
+  const output = safeMountPath(input.mounts.outputHostPath);
+  return [
+    ...isolationArgs(input.job, input.containerName),
     `--mount=type=bind,source=${workspace},target=/workspace,readonly`,
-    `--mount=type=bind,source=${hiddenTests},target=/opt/fpllm/tests,readonly`,
+    `--mount=type=bind,source=${publicTests},target=/opt/fpllm/tests,readonly`,
     `--mount=type=bind,source=${output},target=/output`,
     "--workdir=/workspace",
+    input.image,
+    ...input.command,
+  ];
+}
+
+/**
+ * Learner probe sandbox: learner code and a generic probe server only. Hidden
+ * test code is structurally absent from this mount namespace.
+ */
+export function buildLearnerProbeSandboxArgs(input: {
+  job: SandboxJob;
+  mounts: LearnerProbeMounts;
+  image: string;
+  command: readonly string[];
+  containerName: string;
+  detach?: boolean;
+}): readonly string[] {
+  validateContainerInput(input);
+  const workspace = safeMountPath(input.mounts.workspaceHostPath);
+  const ipc = safeMountPath(input.mounts.ipcHostPath);
+  const base = isolationArgs(input.job, input.containerName);
+  if (input.detach) base.splice(2, 0, "-d");
+  return [
+    ...base,
+    `--mount=type=bind,source=${workspace},target=/workspace,readonly`,
+    `--mount=type=bind,source=${ipc},target=/run/fpllm-ipc`,
+    "--workdir=/workspace",
+    input.image,
+    ...input.command,
+  ];
+}
+
+/**
+ * Trusted hidden evaluator sandbox: private tests and IPC only. Learner source
+ * is structurally absent from this mount namespace; evaluation is black-box
+ * over the Unix-socket probe protocol.
+ */
+export function buildHiddenEvaluatorSandboxArgs(input: {
+  job: SandboxJob;
+  mounts: HiddenEvaluatorMounts;
+  image: string;
+  command: readonly string[];
+  containerName: string;
+}): readonly string[] {
+  validateContainerInput(input);
+  const hiddenTests = safeMountPath(input.mounts.hiddenTestsHostPath);
+  const ipc = safeMountPath(input.mounts.ipcHostPath);
+  const output = safeMountPath(input.mounts.outputHostPath);
+  return [
+    ...isolationArgs(input.job, input.containerName),
+    `--mount=type=bind,source=${hiddenTests},target=/opt/fpllm/tests,readonly`,
+    `--mount=type=bind,source=${ipc},target=/run/fpllm-ipc`,
+    `--mount=type=bind,source=${output},target=/output`,
+    "--workdir=/opt/fpllm/tests",
     input.image,
     ...input.command,
   ];
