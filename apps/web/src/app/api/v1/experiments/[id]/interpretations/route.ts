@@ -5,9 +5,22 @@ import { NextResponse } from "next/server";
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
   const { id } = await context.params;
   const parsed = interpretationCreateSchema.safeParse(await request.json());
-  if (!parsed.success) return NextResponse.json({ ok: false, code: "REQUEST_INVALID", errors: parsed.error.flatten() }, { status: 400 });
+  if (!parsed.success) {
+    return NextResponse.json(
+      { ok: false, code: "REQUEST_INVALID", errors: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
   try {
-    const result = await finalizeInterpretationForDemo({ experimentId: id, ...parsed.data });
+    const result = await finalizeInterpretationForDemo({
+      experimentId: id,
+      observation: parsed.data.observation,
+      interpretation: parsed.data.interpretation,
+      uncertainty: parsed.data.uncertainty,
+      conclusion: parsed.data.conclusion,
+      ...(parsed.data.nextExperiment === undefined ? {} : { nextExperiment: parsed.data.nextExperiment }),
+    });
     return NextResponse.json({ ok: true, ...result }, { status: 201 });
   } catch (error) {
     const code = error instanceof Error ? error.message : "INTERPRETATION_FAILED";
