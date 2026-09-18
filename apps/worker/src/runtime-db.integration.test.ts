@@ -43,18 +43,32 @@ import fs from "node:fs";
 import path from "node:path";
 const args = process.argv.slice(2);
 if (args[0] === "kill" || args[0] === "rm") process.exit(0);
-const outputMount = args.find((value) => value.startsWith("--mount=type=bind,") && value.includes("target=/output"));
-const workspaceMount = args.find((value) => value.startsWith("--mount=type=bind,") && value.includes("target=/workspace"));
-if (!outputMount || !workspaceMount) process.exit(81);
-const outputMatch = outputMount.match(/source=([^,]+),target=\\/output/);
-const workspaceMatch = workspaceMount.match(/source=([^,]+),target=\\/workspace/);
-if (!outputMatch || !workspaceMatch) process.exit(82);
+const mountSource = (target) => {
+  const mount = args.find((value) => value.startsWith("--mount=type=bind,") && value.includes("target=" + target));
+  if (!mount) return null;
+  const escaped = target.replaceAll("/", "\\/");
+  const match = mount.match(new RegExp("source=([^,]+),target=" + escaped));
+  return match?.[1] ?? null;
+};
+if (args.includes("-d")) {
+  const ipc = mountSource("/run/fpllm-ipc");
+  const workspace = mountSource("/workspace");
+  if (!ipc || !workspace) process.exit(84);
+  fs.writeFileSync(path.join(ipc, "probe.ready"), "ready\\n");
+  if (fs.existsSync(path.join(workspace, "FAIL_HIDDEN"))) fs.writeFileSync(path.join(ipc, "probe-fail-hidden"), "1\\n");
+  console.log("fixture-probe-container");
+  process.exit(0);
+}
+const output = mountSource("/output");
+if (!output) process.exit(81);
 const visibilityIndex = args.indexOf("--visibility");
 const bundleIndex = args.indexOf("--bundle-id");
 if (visibilityIndex < 0 || bundleIndex < 0) process.exit(83);
 const visibility = args[visibilityIndex + 1];
 const testBundleId = args[bundleIndex + 1];
-const failHidden = fs.existsSync(path.join(workspaceMatch[1], "FAIL_HIDDEN"));
+const ipc = mountSource("/run/fpllm-ipc");
+if (visibility === "hidden" && mountSource("/workspace")) process.exit(86);
+const failHidden = visibility === "hidden" && ipc && fs.existsSync(path.join(ipc, "probe-fail-hidden"));
 const ids = visibility === "public"
   ? ["attention.shape", "attention.causal", "attention.gqa_equivalence", "attention.gradients"]
   : ["attention.randomized_numerics", "attention.no_permanent_kv_repeat"];
@@ -65,7 +79,7 @@ const results = ids.map((invariantId) => ({
   summary: failHidden && invariantId === "attention.no_permanent_kv_repeat" ? "fixture hidden failure" : "fixture passed",
   evidence: { protocolFixture: true },
 }));
-fs.writeFileSync(path.join(outputMatch[1], visibility + ".json"), JSON.stringify({ schemaVersion: "1", testBundleId, results }));
+fs.writeFileSync(path.join(output, visibility + ".json"), JSON.stringify({ schemaVersion: "1", testBundleId, results }));
 console.log("phase=" + visibility);
 `);
   await chmod(executable, 0o755);
@@ -151,11 +165,14 @@ async function cleanupFixture(input: {
 
 async function runFixture(input: { failHidden: boolean; commitSha: string; workerId: string }) {
   const root = await mkdtemp(join(tmpdir(), "fpllm-worker-db-integration-"));
-  const bundleRoot = join(root, "bundles");
+  const publicBundleRoot = join(root, "public-bundles");
+  const privateBundleRoot = join(root, "private-bundles");
   const scratch = join(root, "scratch");
-  await mkdir(join(bundleRoot, TEST_BUNDLE_ID), { recursive: true });
+  await mkdir(join(publicBundleRoot, TEST_BUNDLE_ID), { recursive: true });
+  await mkdir(join(privateBundleRoot, TEST_BUNDLE_ID), { recursive: true });
   await mkdir(scratch, { recursive: true });
-  await writeFile(join(bundleRoot, TEST_BUNDLE_ID, "runner.py"), "# protocol fixture only\n");
+  await writeFile(join(publicBundleRoot, TEST_BUNDLE_ID, "runner.py"), "# public protocol fixture\n");
+  await writeFile(join(privateBundleRoot, TEST_BUNDLE_ID, "runner.py"), "# private protocol fixture\n");
   const fakeDocker = await writeFakeDocker(root);
   const fixture = await createLeasedFixture({ commitSha: input.commitSha, workerId: input.workerId });
   return {
@@ -175,10 +192,13 @@ async function runFixture(input: { failHidden: boolean; commitSha: string; worke
         },
       },
       config: {
-        privateTestBundleRoot: bundleRoot,
+        publicTestBundleRoot,
+        privateTestBundleRoot,
         dockerImage: "fpllm/test-runtime@sha256:" + "c".repeat(64),
+        hiddenEvaluatorImage: "fpllm/hidden-evaluator@sha256:" + "d".repeat(64),
         dockerBinary: fakeDocker,
         tempRoot: scratch,
+        probeReadyTimeoutMs: 2_000,
       },
     }),
   };
