@@ -30,7 +30,7 @@ function positiveIntegerEnv(name: string, fallback: number, min: number, max: nu
 }
 
 function privateKeyFromEnv(): string {
-  return requiredEnv("FPLLM_GITHUB_APP_PRIVATE_KEY").replaceAll("\\n", "\n");
+  return requiredEnv("GITHUB_APP_PRIVATE_KEY").replaceAll("\\n", "\n");
 }
 
 function digestPinnedImage(name: string): string {
@@ -46,7 +46,7 @@ const dockerImage = digestPinnedImage("FPLLM_TEST_RUNTIME_IMAGE");
 const hiddenEvaluatorImage = digestPinnedImage("FPLLM_HIDDEN_EVALUATOR_IMAGE");
 
 const sourceClient = new GitHubAppClient({
-  appId: requiredEnv("FPLLM_GITHUB_APP_ID"),
+  appId: requiredEnv("GITHUB_APP_ID"),
   privateKey: privateKeyFromEnv(),
 });
 
