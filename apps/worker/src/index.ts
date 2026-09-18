@@ -33,11 +33,17 @@ function privateKeyFromEnv(): string {
   return requiredEnv("FPLLM_GITHUB_APP_PRIVATE_KEY").replaceAll("\\n", "\n");
 }
 
+function digestPinnedImage(name: string): string {
+  const value = requiredEnv(name);
+  if (!/@sha256:[0-9a-f]{64}$/i.test(value)) throw new Error(`${name}_MUST_BE_DIGEST_PINNED`);
+  return value;
+}
+
 const workerId = process.env.FPLLM_WORKER_ID?.trim() || `${hostname()}-${process.pid}`;
 const leaseSeconds = positiveIntegerEnv("FPLLM_WORKER_LEASE_SECONDS", 300, 60, 900);
 const pollMilliseconds = positiveIntegerEnv("FPLLM_WORKER_POLL_MS", 2_000, 250, 60_000);
-const dockerImage = requiredEnv("FPLLM_TEST_RUNTIME_IMAGE");
-if (!/@sha256:[0-9a-f]{64}$/i.test(dockerImage)) throw new Error("FPLLM_TEST_RUNTIME_IMAGE_MUST_BE_DIGEST_PINNED");
+const dockerImage = digestPinnedImage("FPLLM_TEST_RUNTIME_IMAGE");
+const hiddenEvaluatorImage = digestPinnedImage("FPLLM_HIDDEN_EVALUATOR_IMAGE");
 
 const sourceClient = new GitHubAppClient({
   appId: requiredEnv("FPLLM_GITHUB_APP_ID"),
@@ -45,8 +51,10 @@ const sourceClient = new GitHubAppClient({
 });
 
 const runtimeConfig: WorkerRuntimeConfig = {
-  privateTestBundleRoot: requiredEnv("FPLLM_TEST_BUNDLE_ROOT"),
+  publicTestBundleRoot: requiredEnv("FPLLM_PUBLIC_TEST_BUNDLE_ROOT"),
+  privateTestBundleRoot: requiredEnv("FPLLM_PRIVATE_TEST_BUNDLE_ROOT"),
   dockerImage,
+  hiddenEvaluatorImage,
   dockerBinary: process.env.FPLLM_DOCKER_BINARY?.trim() || "docker",
 };
 const tempRoot = process.env.FPLLM_WORKER_TEMP_ROOT?.trim();
@@ -136,6 +144,8 @@ async function main(): Promise<void> {
     pollMilliseconds,
     executionEnabled: true,
     dockerImage,
+    hiddenEvaluatorImage,
+    hiddenEvaluatorIsolation: "separate-container-unix-socket",
     runOnce,
   });
 
