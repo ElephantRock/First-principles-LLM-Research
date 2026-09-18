@@ -44,6 +44,18 @@ export interface SandboxMounts {
 }
 
 const FULL_GIT_SHA = /^[0-9a-f]{40}$/i;
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
+
+export function assertSafeRepositoryRelativePath(path: string): void {
+  if (!path || path.length > 4096) throw new Error("REPOSITORY_PATH_INVALID");
+  if (path.startsWith("/") || path.includes("\\") || CONTROL_CHARACTER.test(path)) {
+    throw new Error("REPOSITORY_PATH_UNSAFE");
+  }
+  const segments = path.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === ".." || segment.length > 255)) {
+    throw new Error("REPOSITORY_PATH_UNSAFE");
+  }
+}
 
 export function assertSandboxJob(value: unknown): asserts value is SandboxJob {
   if (!value || typeof value !== "object") throw new Error("SANDBOX_JOB_INVALID");
