@@ -9,7 +9,7 @@
     "db:migrate": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",
     "typecheck": "prisma generate && tsc --noEmit",
-    "test": "prisma generate && tsx --test src/jobs.integration.test.ts",
+    "test": "prisma generate && tsx --test src/jobs.integration.test.ts src/evidence-flow.integration.test.ts",
     "lint": "prisma generate && tsc --noEmit"
   },
   "dependencies": {
