@@ -9,7 +9,6 @@ IMAGE="fpllm/test-runtime:ci"
 BUNDLE_ID="phase1-causal-attention@1.0"
 ROOT="$(git rev-parse --show-toplevel)"
 TMP="$(mktemp -d)"
-PROBE_CLIENT="$ROOT/scripts/ci/probe_memory_trace_client.py"
 
 cleanup() {
   docker rm -f fpllm-ci-probe-good fpllm-ci-probe-bad >/dev/null 2>&1 || true
@@ -115,7 +114,18 @@ run_probe_trace() {
     exit 1
   fi
 
-  python "$PROBE_CLIENT" --socket "$ipc/probe.sock" --expect "$expectation"
+  # Run the client under the same unprivileged UID as the evaluator topology.
+  # This avoids weakening the socket permissions solely for CI host access.
+  docker run --rm \
+    "${sandbox_common[@]}" \
+    --mount="type=bind,source=$ROOT/scripts/ci,target=/opt/fpllm-ci,readonly" \
+    --mount="type=bind,source=$ipc,target=/run/fpllm-ipc" \
+    --workdir=/tmp \
+    "$IMAGE" \
+    python /opt/fpllm-ci/probe_memory_trace_client.py \
+      --socket /run/fpllm-ipc/probe.sock \
+      --expect "$expectation"
+
   docker rm -f "$container" >/dev/null
 }
 
