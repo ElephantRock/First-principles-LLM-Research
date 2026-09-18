@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "test_bundle_id": "phase1-causal-attention@1.0",
+  "lab_id": "phase1-causal-attention-lab",
+  "lab_version": "1.0",
+  "public_invariants": [
+    "attention.shape",
+    "attention.causal",
+    "attention.gqa_equivalence",
+    "attention.gradients"
+  ],
+  "hidden_invariants": [
+    "attention.randomized_numerics",
+    "attention.no_permanent_kv_repeat"
+  ],
+  "visibility_note": "This public contract enumerates documented invariants only. Hidden fixtures, seeds, randomized cases, and solution-sensitive assertions are not stored in this public repository."
+}
