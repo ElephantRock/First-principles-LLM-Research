@@ -5,6 +5,7 @@ const FULL_GIT_OBJECT_SHA = /^[0-9a-f]{40}$/i;
 const MAX_TREE_ENTRIES = 10_000;
 const MAX_REPOSITORY_BYTES = 128 * 1024 * 1024;
 const MAX_BLOB_BYTES = 16 * 1024 * 1024;
+const TOKEN_REFRESH_SKEW_MS = 60_000;
 
 function base64url(value: string | Buffer): string {
   return Buffer.from(value).toString("base64url");
@@ -40,6 +41,8 @@ export interface GitHubRepositoryTreeBlob {
 }
 
 export class GitHubAppClient {
+  private readonly tokenCache = new Map<string, { token: string; expiresAtMs: number }>();
+
   constructor(private readonly config: { appId: string; privateKey: string }) {}
 
   private jwt() {
@@ -57,6 +60,10 @@ export class GitHubAppClient {
   }
 
   async installationToken(installationId: string | number): Promise<string> {
+    const cacheKey = String(installationId);
+    const cached = this.tokenCache.get(cacheKey);
+    if (cached && cached.expiresAtMs - TOKEN_REFRESH_SKEW_MS > Date.now()) return cached.token;
+
     const response = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
       method: "POST",
       headers: {
@@ -67,7 +74,10 @@ export class GitHubAppClient {
       },
     });
     if (!response.ok) throw new Error(`GITHUB_INSTALLATION_TOKEN_FAILED:${response.status}`);
-    const body = await response.json() as { token: string };
+    const body = await response.json() as { token: string; expires_at: string };
+    const expiresAtMs = new Date(body.expires_at).getTime();
+    if (!body.token || !Number.isFinite(expiresAtMs)) throw new Error("GITHUB_INSTALLATION_TOKEN_INVALID");
+    this.tokenCache.set(cacheKey, { token: body.token, expiresAtMs });
     return body.token;
   }
 
@@ -108,12 +118,17 @@ export class GitHubAppClient {
   }): Promise<readonly GitHubRepositoryTreeBlob[]> {
     if (!FULL_GIT_SHA.test(input.commitSha)) throw new Error("COMMIT_SHA_INVALID");
     const headers = await this.installationHeaders(input.installationId);
-    const response = await fetch(
-      `${apiRepo(input.owner, input.repo)}/git/trees/${input.commitSha}?recursive=1`,
-      { headers },
-    );
-    if (!response.ok) throw new Error(`GITHUB_TREE_FETCH_FAILED:${response.status}`);
-    const body = await response.json() as {
+    const repositoryUrl = apiRepo(input.owner, input.repo);
+
+    const commitResponse = await fetch(`${repositoryUrl}/git/commits/${input.commitSha}`, { headers });
+    if (!commitResponse.ok) throw new Error(`GITHUB_COMMIT_FETCH_FAILED:${commitResponse.status}`);
+    const commit = await commitResponse.json() as { sha: string; tree: { sha: string } };
+    if (commit.sha.toLowerCase() !== input.commitSha.toLowerCase()) throw new Error("GITHUB_COMMIT_IDENTITY_MISMATCH");
+    if (!FULL_GIT_OBJECT_SHA.test(commit.tree?.sha ?? "")) throw new Error("GITHUB_TREE_SHA_INVALID");
+
+    const treeResponse = await fetch(`${repositoryUrl}/git/trees/${commit.tree.sha}?recursive=1`, { headers });
+    if (!treeResponse.ok) throw new Error(`GITHUB_TREE_FETCH_FAILED:${treeResponse.status}`);
+    const body = await treeResponse.json() as {
       truncated: boolean;
       tree: Array<{ path: string; mode: string; type: string; sha: string; size?: number }>;
     };
@@ -129,7 +144,8 @@ export class GitHubAppClient {
         throw new Error(`GITHUB_TREE_MODE_UNSUPPORTED:${entry.mode}`);
       }
       if (!FULL_GIT_OBJECT_SHA.test(entry.sha)) throw new Error("GITHUB_BLOB_SHA_INVALID");
-      const size = entry.size ?? 0;
+      if (entry.size === undefined) throw new Error("GITHUB_BLOB_SIZE_MISSING");
+      const size = entry.size;
       if (!Number.isSafeInteger(size) || size < 0 || size > MAX_BLOB_BYTES) throw new Error("GITHUB_BLOB_TOO_LARGE");
       totalBytes += size;
       if (totalBytes > MAX_REPOSITORY_BYTES) throw new Error("GITHUB_REPOSITORY_TOO_LARGE");
