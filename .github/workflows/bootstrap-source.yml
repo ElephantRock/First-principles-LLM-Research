@@ -1,0 +1,63 @@
+name: Bootstrap source
+
+on:
+  push:
+    branches:
+      - bootstrap/platform-v0.2
+    paths:
+      - 'bootstrap/**'
+      - '.github/workflows/bootstrap-source.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bootstrap branch
+        uses: actions/checkout@v4
+        with:
+          ref: bootstrap/platform-v0.2
+          fetch-depth: 0
+
+      - name: Reconstruct source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat \
+            bootstrap/part00.b64 \
+            bootstrap/part01.b64 \
+            bootstrap/part02.b64 \
+            bootstrap/part03.b64 \
+            bootstrap/part04.b64 \
+            bootstrap/part05.b64 \
+            bootstrap/part06.b64 \
+            bootstrap/part07.*.b64 \
+            bootstrap/part08.*.b64 \
+            bootstrap/part09.*.b64 \
+            bootstrap/part10.*.b64 \
+            bootstrap/part11.*.b64 \
+            bootstrap/part12.*.b64 \
+            | base64 --decode > /tmp/fpllm-v0.2.zip
+          rm -rf /tmp/fpllm-stage
+          mkdir -p /tmp/fpllm-stage
+          unzip -q /tmp/fpllm-v0.2.zip -d /tmp/fpllm-stage
+          test -d /tmp/fpllm-stage/first-principles-llm-research-phase1
+          cp -a /tmp/fpllm-stage/first-principles-llm-research-phase1/. .
+          rm -rf bootstrap
+          rm -f .github/workflows/bootstrap-source.yml
+
+      - name: Commit materialized source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'No materialization changes to commit.'
+            exit 0
+          fi
+          git commit -m 'bootstrap: materialize platform v0.2 source'
+          git push origin HEAD:bootstrap/platform-v0.2
