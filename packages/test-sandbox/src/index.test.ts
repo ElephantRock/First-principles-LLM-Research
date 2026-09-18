@@ -38,8 +38,10 @@ test("Docker sandbox arguments enforce the minimum isolation contract", () => {
     },
     image: "fpllm/test-runtime:dev",
     command: ["python", "-m", "pytest", "/opt/fpllm/tests"],
+    containerName: "fpllm-run-123",
   });
 
+  assert.ok(args.includes("--name=fpllm-run-123"));
   assert.ok(args.includes("--network=none"));
   assert.ok(args.includes("--read-only"));
   assert.ok(args.includes("--cap-drop=ALL"));
@@ -66,6 +68,23 @@ test("sandbox contract rejects network-enabled jobs", () => {
       command: ["python", "-m", "pytest"],
     }),
     /SANDBOX_NETWORK_MUST_BE_DISABLED/,
+  );
+});
+
+test("sandbox contract rejects unsafe container names", () => {
+  assert.throws(
+    () => buildDockerSandboxArgs({
+      job,
+      mounts: {
+        workspaceHostPath: "/srv/fpllm/workspace",
+        hiddenTestsHostPath: "/srv/fpllm/hidden-tests",
+        outputHostPath: "/srv/fpllm/output",
+      },
+      image: "fpllm/test-runtime:dev",
+      command: ["python", "-m", "pytest"],
+      containerName: "bad name;docker",
+    }),
+    /SANDBOX_CONTAINER_NAME_INVALID/,
   );
 });
 
