@@ -24,7 +24,7 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
       ].filter((value) => value === "passed").length
     : 0;
 
-  return <html lang="en"><body><AppShell operational={{
+  return <html lang="en"><body><AppShell authenticated={snap !== null} operational={{
     vramGiB: snap?.compute?.vramGiB ?? null,
     precision: snap?.compute?.precision ?? null,
     profile: snap?.compute?.selectedProfile ?? null,
