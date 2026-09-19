@@ -11,5 +11,6 @@
 9. `CAUSAL_ATTENTION_MEMORY_TRACE_v2.md` — regression-tested structural evidence contract for `attention.no_permanent_kv_repeat`; supersedes the adapter document's earlier schema-1 memory-trace section where they conflict.
 10. `RUNTIME_IMAGE_PROVENANCE_v0.3.md` — base-image pinning, OCI/FPLLM labels, CI provenance artifacts, and the registry-publication evidence boundary.
 11. `STAGING_RELEASE_GATES_v0.3.md` — exact S1–S6 evidence required before the real-worker v0.3 release can leave draft status.
+12. `STAGING_SUBMISSION_E2E_v0.3.md` — guarded GitHub Actions harness for the real GitHub App -> durable job -> worker -> Docker -> persisted-evidence release gate.
 
 The decision register has precedence if a conflict is discovered. Runtime subcontracts may narrow implementation details but must not weaken the frozen security or evidence invariants.
