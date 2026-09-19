@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
   createVerifiedExperimentForDemo,
@@ -11,7 +11,9 @@ import { GitHubAppClient } from "../../../packages/github/src/index.ts";
 
 const FULL_SHA = /^[0-9a-f]{40}$/i;
 const DIGEST_IMAGE = /@sha256:[0-9a-f]{64}$/i;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 const TEST_BUNDLE_ID = "phase1-causal-attention@1.0";
+const PRIVATE_BUNDLE_COMMITMENT_PATH = "hidden-tests/phase1/causal-attention/private-bundle-commitment.json";
 
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
@@ -33,6 +35,52 @@ function digestImageEnv(name: string): string {
 
 function privateKeyFromEnv(): string {
   return requiredEnv("GITHUB_APP_PRIVATE_KEY").replaceAll("\\n", "\n");
+}
+
+async function loadPrivateEvaluatorCommitment() {
+  const configured = process.env.FPLLM_PRIVATE_BUNDLE_COMMITMENT_PATH?.trim() || PRIVATE_BUNDLE_COMMITMENT_PATH;
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(resolve(configured), "utf8"));
+  } catch (error) {
+    throw new Error("STAGING_PRIVATE_BUNDLE_COMMITMENT_INVALID", { cause: error });
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("STAGING_PRIVATE_BUNDLE_COMMITMENT_INVALID");
+  }
+  const document = value as Record<string, unknown>;
+  const hiddenInvariants = document.hiddenInvariants;
+  if (
+    document.schemaVersion !== "1" ||
+    document.testBundleId !== TEST_BUNDLE_ID ||
+    typeof document.privateEvaluatorVersion !== "string" ||
+    document.privateEvaluatorVersion.length < 1 ||
+    document.archiveFormat !== "tar.gz" ||
+    typeof document.archiveSha256 !== "string" ||
+    !SHA256_HEX.test(document.archiveSha256) ||
+    typeof document.archiveBytes !== "number" ||
+    !Number.isSafeInteger(document.archiveBytes) ||
+    document.archiveBytes <= 0 ||
+    document.adapterInterface !== "causal-attention-v1" ||
+    document.memoryTraceSchema !== "2" ||
+    !Array.isArray(hiddenInvariants) ||
+    hiddenInvariants.length !== 2 ||
+    hiddenInvariants[0] !== "attention.randomized_numerics" ||
+    hiddenInvariants[1] !== "attention.no_permanent_kv_repeat"
+  ) {
+    throw new Error("STAGING_PRIVATE_BUNDLE_COMMITMENT_CONTRACT_INVALID");
+  }
+
+  return {
+    commitmentPath: PRIVATE_BUNDLE_COMMITMENT_PATH,
+    privateEvaluatorVersion: document.privateEvaluatorVersion,
+    archiveFormat: document.archiveFormat,
+    archiveSha256: document.archiveSha256,
+    archiveBytes: document.archiveBytes,
+    adapterInterface: document.adapterInterface,
+    memoryTraceSchema: document.memoryTraceSchema,
+    hiddenInvariants: [...hiddenInvariants] as string[],
+  };
 }
 
 async function runWorkerOnce(label: string): Promise<void> {
@@ -272,6 +320,7 @@ async function main() {
   const evaluatorImage = digestImageEnv("FPLLM_HIDDEN_EVALUATOR_IMAGE");
   requiredEnv("FPLLM_PUBLIC_TEST_BUNDLE_ROOT");
   requiredEnv("FPLLM_PRIVATE_TEST_BUNDLE_ROOT");
+  const privateEvaluator = await loadPrivateEvaluatorCommitment();
 
   const client = new GitHubAppClient({
     appId: requiredEnv("GITHUB_APP_ID"),
@@ -334,8 +383,10 @@ async function main() {
       testBundleId: TEST_BUNDLE_ID,
       adapterInterface: "causal-attention-v1",
       memoryTraceSchema: "2",
+      privateEvaluator,
     },
     assertions: {
+      privateEvaluatorMatchedPublicCommitment: true,
       githubAppResolvedExactGoodSha: true,
       githubAppResolvedExactBadSha: true,
       goodCommitPassedAndUnlockedExperiment: true,
