@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   pkceChallenge,
+  sanitizeReturnTo,
   signRepositoryAuthorization,
   verifyRepositoryAuthorization,
   type RepositoryAuthorizationPayload,
@@ -18,6 +19,21 @@ const PAYLOAD: RepositoryAuthorizationPayload = {
   defaultBranch: "main",
   expiresAt: 2_000_000,
 };
+
+describe("OAuth return paths", () => {
+  it("keeps normal internal paths", () => {
+    expect(sanitizeReturnTo("/home?from=setup")).toBe("/home?from=setup");
+    expect(sanitizeReturnTo("/lab/phase-1/causal-attention")).toBe("/lab/phase-1/causal-attention");
+  });
+
+  it("rejects absolute, auth-loop, protocol-relative, and backslash paths", () => {
+    expect(sanitizeReturnTo("https://evil.example/" as string)).toBe("/home");
+    expect(sanitizeReturnTo("//evil.example/")).toBe("/home");
+    expect(sanitizeReturnTo("/\\evil.example")).toBe("/home");
+    expect(sanitizeReturnTo("/safe\\evil.example")).toBe("/home");
+    expect(sanitizeReturnTo("/auth/logout")).toBe("/home");
+  });
+});
 
 describe("repository authorization", () => {
   it("round-trips a session-bound signed authorization", () => {
