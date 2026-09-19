@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
 import { experimentArtifactSchema } from "@fpllm/api-contracts";
-import { importExperimentArtifactForDemo } from "@fpllm/db";
+import { importExperimentArtifactForUser } from "@fpllm/db";
 import { NextResponse } from "next/server";
+import { getCurrentLearner } from "@/lib/auth";
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
+  const current = await getCurrentLearner();
+  if (!current) return NextResponse.json({ ok: false, code: "AUTHENTICATION_REQUIRED" }, { status: 401 });
   const { id } = await context.params;
   const raw: unknown = await request.json();
   const parsed = experimentArtifactSchema.safeParse(raw);
@@ -34,7 +37,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
   };
 
   try {
-    const result = await importExperimentArtifactForDemo({
+    const result = await importExperimentArtifactForUser(current.user.id, {
       experimentDbId: id,
       artifact,
       sha256,

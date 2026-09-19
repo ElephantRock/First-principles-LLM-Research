@@ -10,11 +10,15 @@ const requiredInvariantIds = [
   "attention.no_permanent_kv_repeat",
 ] as const;
 
+type RequiredTestResult = {
+  invariantId: string | null;
+  passed: boolean;
+};
+
 /** Create an experiment only from immutable submission evidence that actually passed the required test bundle. */
-export async function createVerifiedExperimentForDemo(submissionId: string) {
-  const user = await getDemoUser();
+export async function createVerifiedExperimentForUser(userId: string, submissionId: string) {
   const submission = await prisma.submission.findFirst({
-    where: { id: submissionId, userId: user.id },
+    where: { id: submissionId, userId },
     include: {
       testRuns: {
         where: { state: "passed" },
@@ -29,7 +33,11 @@ export async function createVerifiedExperimentForDemo(submissionId: string) {
 
   const passingRun = submission.testRuns[0];
   if (!passingRun) throw new Error("PASSING_TEST_RUN_REQUIRED");
-  const resultByInvariant = new Map(passingRun.results.map((result) => [result.invariantId, result]));
+  const resultByInvariant = new Map<string, RequiredTestResult>(
+    passingRun.results.flatMap((result: RequiredTestResult) =>
+      result.invariantId ? [[result.invariantId, result] as [string, RequiredTestResult]] : [],
+    ),
+  );
   const completePass = requiredInvariantIds.every((id) => resultByInvariant.get(id)?.passed === true);
   if (!completePass) throw new Error("REQUIRED_TEST_EVIDENCE_INCOMPLETE");
 
@@ -53,7 +61,7 @@ export async function createVerifiedExperimentForDemo(submissionId: string) {
     return tx.experiment.create({
       data: {
         displayId,
-        userId: user.id,
+        userId,
         submissionId: submission.id,
         experimentType: "attention_memory_scaling",
         state: "draft",
@@ -61,4 +69,9 @@ export async function createVerifiedExperimentForDemo(submissionId: string) {
       },
     });
   });
+}
+
+export async function createVerifiedExperimentForDemo(submissionId: string) {
+  const user = await getDemoUser();
+  return createVerifiedExperimentForUser(user.id, submissionId);
 }

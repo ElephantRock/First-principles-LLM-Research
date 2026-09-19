@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "turbo dev",
     "build": "turbo build",
-    "typecheck": "turbo typecheck",
-    "test": "turbo test",
+    "typecheck": "pnpm db:generate && turbo typecheck",
+    "test": "pnpm db:generate && turbo test",
     "lint": "turbo lint",
     "content:validate": "pnpm --filter @fpllm/content validate",
     "db:generate": "pnpm --filter @fpllm/db db:generate",

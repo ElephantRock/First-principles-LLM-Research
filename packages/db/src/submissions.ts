@@ -15,10 +15,12 @@ export interface VerifiedRepositoryIdentity {
   defaultBranch: string | null;
 }
 
-export async function getBoundRepositoryIdentityForDemo(repositoryId: string): Promise<VerifiedRepositoryIdentity> {
-  const user = await getDemoUser();
+export async function getBoundRepositoryIdentityForUser(
+  userId: string,
+  repositoryId: string,
+): Promise<VerifiedRepositoryIdentity> {
   const repository = await prisma.repository.findFirst({
-    where: { id: repositoryId, userId: user.id, provider: "github" },
+    where: { id: repositoryId, userId, provider: "github" },
     include: { githubInstallation: true },
   });
 
@@ -36,17 +38,23 @@ export async function getBoundRepositoryIdentityForDemo(repositoryId: string): P
   };
 }
 
-export async function createVerifiedSubmissionAndQueueForDemo(input: {
-  repositoryId: string;
-  branch: string;
-  commitSha: string;
-  labVersion: string;
-}) {
+export async function getBoundRepositoryIdentityForDemo(repositoryId: string): Promise<VerifiedRepositoryIdentity> {
   const user = await getDemoUser();
+  return getBoundRepositoryIdentityForUser(user.id, repositoryId);
+}
 
+export async function createVerifiedSubmissionAndQueueForUser(
+  userId: string,
+  input: {
+    repositoryId: string;
+    branch: string;
+    commitSha: string;
+    labVersion: string;
+  },
+) {
   return prisma.$transaction(async (tx) => {
     const repository = await tx.repository.findFirst({
-      where: { id: input.repositoryId, userId: user.id, provider: "github" },
+      where: { id: input.repositoryId, userId, provider: "github" },
       include: { githubInstallation: true },
     });
     if (!repository) throw new Error("REPOSITORY_NOT_FOUND");
@@ -60,7 +68,7 @@ export async function createVerifiedSubmissionAndQueueForDemo(input: {
 
     const submission = await tx.submission.create({
       data: {
-        userId: user.id,
+        userId,
         repositoryId: repository.id,
         courseVersionId: courseVersion.id,
         labId: CAUSAL_ATTENTION_LAB_ID,
@@ -112,7 +120,7 @@ export async function createVerifiedSubmissionAndQueueForDemo(input: {
 
     await tx.auditEvent.create({
       data: {
-        actorUserId: user.id,
+        actorUserId: userId,
         eventType: "submission.queued",
         objectType: "submission",
         objectId: submission.id,
@@ -133,4 +141,14 @@ export async function createVerifiedSubmissionAndQueueForDemo(input: {
       job: { id: job.id, state: job.state, jobType: job.jobType },
     };
   });
+}
+
+export async function createVerifiedSubmissionAndQueueForDemo(input: {
+  repositoryId: string;
+  branch: string;
+  commitSha: string;
+  labVersion: string;
+}) {
+  const user = await getDemoUser();
+  return createVerifiedSubmissionAndQueueForUser(user.id, input);
 }
