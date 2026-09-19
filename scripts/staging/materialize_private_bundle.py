@@ -140,7 +140,13 @@ def main() -> int:
             if len(data) != member.size:
                 raise SystemExit("PRIVATE_BUNDLE_MEMBER_SIZE_MISMATCH")
             target.write_bytes(data)
-            target.chmod(0o600)
+            # The evaluator container deliberately runs as numeric UID 65532,
+            # which differs from the host worker identity that materializes this
+            # directory.  The private bundle is protected from learner code by
+            # mount-namespace separation, not by host-owner-only file modes.
+            # Make files immutable/readable through the evaluator's read-only
+            # bind mount while keeping the bundle absent from learner mounts.
+            target.chmod(0o444)
 
     runner = bundle_root / "runner.py"
     if not runner.is_file() or runner.stat().st_size <= 0:
