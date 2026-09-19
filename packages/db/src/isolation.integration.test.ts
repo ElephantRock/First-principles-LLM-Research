@@ -112,6 +112,8 @@ async function cleanup(f: Awaited<ReturnType<typeof buildFixture>>) {
   await prisma.repositoryBinding.deleteMany({ where: { repositoryId: f.repositoryB.id } });
   await prisma.repository.deleteMany({ where: { id: f.repositoryB.id } });
   await prisma.gitHubInstallation.deleteMany({ where: { id: f.installation.id } });
+  await prisma.computeProfile.deleteMany({ where: { userId: f.userB.id } });
+  await prisma.masteryEvidence.deleteMany({ where: { userId: f.userB.id } });
   await prisma.user.deleteMany({ where: { id: { in: [f.userA.id, f.userB.id] } } });
 }
 
