@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { prisma } from "./client";
 import { getLatestEnvironmentQualificationForUser, qualifyEnvironment, recordEnvironmentReportForUser } from "./environment";
+import { getLearnerSnapshot } from "./repositories";
 
 const GIB = 1024 ** 3;
 
@@ -80,7 +81,7 @@ test("authenticated environment evidence creates a learner-owned compute profile
   }
 });
 
-test("latest qualification returns the compute profile produced by the selected captured report", async () => {
+test("latest qualification and learner snapshot use the compute profile produced by the selected captured report", async () => {
   const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const user = await prisma.user.create({ data: { handle: `environment-order-${suffix}` } });
 
@@ -109,6 +110,10 @@ test("latest qualification returns the compute profile produced by the selected 
     assert.equal(latest.computeProfile?.id, current.computeProfileId);
     assert.equal(latest.computeProfile?.selectedProfile, "8gb");
     assert.equal(latest.qualification.selectedProfile, "8gb");
+
+    const snapshot = await getLearnerSnapshot(user.id);
+    assert.equal(snapshot.compute?.id, current.computeProfileId);
+    assert.equal(snapshot.compute?.selectedProfile, "8gb");
   } finally {
     await prisma.computeProfile.deleteMany({ where: { userId: user.id } });
     await prisma.environmentReport.deleteMany({ where: { userId: user.id } });
