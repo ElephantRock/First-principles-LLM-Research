@@ -44,6 +44,17 @@ test("vertical slice uses a real bearer session rather than demo auth fallback",
   }
 });
 
+test("application shell exposes POST sign-out and revokes the bearer session", async ({ page, context }) => {
+  await authenticate(context, "fresh");
+
+  await page.goto("/home");
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await expect(page).toHaveURL(/\/auth\/sign-in$/);
+
+  const me = await context.request.get(`${BASE_URL}/api/v1/me`);
+  expect(me.status()).toBe(401);
+});
+
 test("fresh learner completes no-seed onboarding through queued, running, and evidence UX", async ({ page, context }) => {
   const user = await authenticate(context, "fresh");
 
