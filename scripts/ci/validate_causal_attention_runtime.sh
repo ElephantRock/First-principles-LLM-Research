@@ -59,6 +59,8 @@ sandbox_common=(
 rm -rf "$ARTIFACT_DIR"
 mkdir -p "$ARTIFACT_DIR"
 
+python "$ROOT/scripts/ci/test_private_bundle_materializer.py"
+
 echo "Building learner runtime image..."
 docker build --pull \
   --build-arg "SOURCE_COMMIT=$SOURCE_COMMIT" \
