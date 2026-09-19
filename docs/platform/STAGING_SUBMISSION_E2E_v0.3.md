@@ -104,6 +104,7 @@ The JSON records:
 - GitHub installation ID;
 - exact good/bad commit SHAs;
 - digest-addressed learner and evaluator images;
+- committed private evaluator version, archive SHA-256/size, adapter interface, memory-trace schema, and hidden invariant list;
 - test-bundle/interface/schema identities;
 - submission/test-run/job IDs and terminal states;
 - persisted execution IDs;
@@ -112,13 +113,14 @@ The JSON records:
 - experiment unlocked/blocked result;
 - explicit release-gate assertions.
 
-The private bundle's public SHA-256/size/version commitment remains independently available in the repository. The staging evidence does **not** contain the GitHub App private key, installation access token, private evaluator source, randomized hidden cases or seeds, database credentials, or GHCR credentials.
+The staging evidence does **not** contain the GitHub App private key, installation access token, private evaluator source, randomized hidden cases or seeds, database credentials, or GHCR credentials.
 
 ## 6. Acceptance criteria
 
 The staging gate is satisfied only when the evidence artifact asserts all of the following and the workflow itself is green:
 
 ```text
+privateEvaluatorMatchedPublicCommitment = true
 githubAppResolvedExactGoodSha = true
 githubAppResolvedExactBadSha = true
 goodCommitPassedAndUnlockedExperiment = true
@@ -126,7 +128,7 @@ badCommitProducedHiddenFailureAndBlockedExperiment = true
 identicalGoodIdentityReexecutedAsDistinctEvidence = true
 ```
 
-In addition, the staging workflow must have accepted the private bundle against the repository commitment before the worker starts. A CI-local fixture run is not a substitute for this staging artifact.
+The first assertion is only emitted after the workflow materializer has accepted the secret archive against the repository commitment and the staging runner has loaded the same public commitment into the evidence document. A CI-local fixture run is not a substitute for this staging artifact.
 
 ## 7. Remaining boundary after this gate
 
