@@ -1,8 +1,12 @@
 import { environmentReportSchema } from "@fpllm/api-contracts";
-import { getDemoUser, prisma } from "@fpllm/db";
+import { prisma } from "@fpllm/db";
 import { NextResponse } from "next/server";
+import { getCurrentLearner } from "@/lib/auth";
 
 export async function POST(request: Request) {
+  const current = await getCurrentLearner();
+  if (!current) return NextResponse.json({ ok: false, code: "AUTHENTICATION_REQUIRED" }, { status: 401 });
+
   const parsed = environmentReportSchema.safeParse(await request.json());
   if (!parsed.success) {
     return NextResponse.json(
@@ -11,10 +15,9 @@ export async function POST(request: Request) {
     );
   }
 
-  const user = await getDemoUser();
   const row = await prisma.environmentReport.create({
     data: {
-      userId: user.id,
+      userId: current.user.id,
       pythonVersion: parsed.data.pythonVersion ?? null,
       pytorchVersion: parsed.data.pytorchVersion ?? null,
       operatingSystem: parsed.data.operatingSystem ?? null,

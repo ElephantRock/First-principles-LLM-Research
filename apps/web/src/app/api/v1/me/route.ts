@@ -9,14 +9,17 @@ export async function GET() {
 
   return NextResponse.json({
     ok: true,
+    mode: current.mode,
     user: {
       id: current.user.id,
       handle: current.user.handle,
       displayName: current.user.displayName,
     },
-    session: {
-      id: current.session.id,
-      expiresAt: current.session.expiresAt.toISOString(),
-    },
+    session: current.session
+      ? {
+          id: current.session.id,
+          expiresAt: current.session.expiresAt.toISOString(),
+        }
+      : null,
   });
 }

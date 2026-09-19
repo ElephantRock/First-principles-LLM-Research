@@ -1,5 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import { resolveSessionToken } from "@fpllm/db";
+import { getDemoUser, resolveSessionToken } from "@fpllm/db";
 import { cookies } from "next/headers";
 
 export const SESSION_COOKIE_NAME = "fpllm_session";
@@ -46,12 +46,28 @@ export function secureCookie(): boolean {
 export async function getCurrentLearner() {
   const cookieStore = await cookies();
   const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-  if (!token) return null;
-  return resolveSessionToken(token);
+  if (token) {
+    const resolved = await resolveSessionToken(token);
+    if (resolved) return { mode: "session" as const, ...resolved };
+  }
+
+  // Explicit migration/test escape hatch only. Production defaults to disabled.
+  if (process.env.FPLLM_DEMO_AUTH === "1") {
+    const user = await getDemoUser();
+    return { mode: "demo" as const, user, session: null };
+  }
+  return null;
 }
 
 export async function requireCurrentLearner() {
   const current = await getCurrentLearner();
   if (!current) throw new AuthenticationRequiredError();
   return current;
+}
+
+export function authenticationErrorResponse(error: unknown): { code: string; status: number } | null {
+  if (error instanceof AuthenticationRequiredError || (error instanceof Error && error.message === "AUTHENTICATION_REQUIRED")) {
+    return { code: "AUTHENTICATION_REQUIRED", status: 401 };
+  }
+  return null;
 }
