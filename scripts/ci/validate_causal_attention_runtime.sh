@@ -6,12 +6,24 @@ GOOD_REF="refs/heads/fixture/causal-attention-good-v1"
 BAD_KV_SHA="3ccf5ba08f37c5d35b56e66b9e78993eb117d93f"
 BAD_KV_REF="refs/heads/fixture/causal-attention-bad-kv-repeat-v1"
 IMAGE="fpllm/test-runtime:ci"
+EVALUATOR_IMAGE="fpllm/hidden-evaluator:ci"
 BUNDLE_ID="phase1-causal-attention@1.0"
 ROOT="$(git rev-parse --show-toplevel)"
 TMP="$(mktemp -d)"
+ARTIFACT_DIR="$ROOT/.artifacts/runtime-release"
+SOURCE_COMMIT="${FPLLM_SOURCE_COMMIT:-$(git rev-parse HEAD)}"
+
+if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "FPLLM_SOURCE_COMMIT must be a full lowercase commit SHA" >&2
+  exit 1
+fi
 
 cleanup() {
-  docker rm -f fpllm-ci-probe-good fpllm-ci-probe-bad >/dev/null 2>&1 || true
+  docker rm -f \
+    fpllm-ci-probe-good \
+    fpllm-ci-probe-bad \
+    fpllm-ci-topology-learner \
+    fpllm-ci-topology-evaluator >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -44,8 +56,37 @@ sandbox_common=(
   --tmpfs=/tmp:rw,nosuid,nodev,noexec,size=256m
 )
 
+rm -rf "$ARTIFACT_DIR"
+mkdir -p "$ARTIFACT_DIR"
+
 echo "Building learner runtime image..."
-docker build --pull -f "$ROOT/infra/docker/test-runtime/Dockerfile" -t "$IMAGE" "$ROOT/infra/docker/test-runtime"
+docker build --pull \
+  --build-arg "SOURCE_COMMIT=$SOURCE_COMMIT" \
+  -f "$ROOT/infra/docker/test-runtime/Dockerfile" \
+  -t "$IMAGE" \
+  "$ROOT/infra/docker/test-runtime"
+
+echo "Building hidden evaluator runtime image..."
+docker build --pull \
+  --build-arg "SOURCE_COMMIT=$SOURCE_COMMIT" \
+  -f "$ROOT/infra/docker/hidden-evaluator/Dockerfile" \
+  -t "$EVALUATOR_IMAGE" \
+  "$ROOT/infra/docker/hidden-evaluator"
+
+python "$ROOT/scripts/release/runtime_image_provenance.py" \
+  --image "$IMAGE" \
+  --role learner-runtime \
+  --dockerfile infra/docker/test-runtime/Dockerfile \
+  --input infra/docker/test-runtime/probe \
+  --source-commit "$SOURCE_COMMIT" \
+  --output "$ARTIFACT_DIR/learner-runtime.provenance.json"
+
+python "$ROOT/scripts/release/runtime_image_provenance.py" \
+  --image "$EVALUATOR_IMAGE" \
+  --role hidden-evaluator \
+  --dockerfile infra/docker/hidden-evaluator/Dockerfile \
+  --source-commit "$SOURCE_COMMIT" \
+  --output "$ARTIFACT_DIR/hidden-evaluator.provenance.json"
 
 GOOD="$TMP/good"
 BAD="$TMP/bad-kv"
@@ -66,6 +107,8 @@ docker run --rm \
     --bundle-id "$BUNDLE_ID" \
     --visibility public \
     --output /output/public.json
+
+cp "$PUBLIC_OUT/public.json" "$ARTIFACT_DIR/known-good-public-evidence.json"
 
 python - "$PUBLIC_OUT/public.json" <<'PY'
 import json, sys
@@ -114,8 +157,6 @@ run_probe_trace() {
     exit 1
   fi
 
-  # Run the client under the same unprivileged UID as the evaluator topology.
-  # This avoids weakening the socket permissions solely for CI host access.
   docker run --rm \
     "${sandbox_common[@]}" \
     --mount="type=bind,source=$ROOT/scripts/ci,target=/opt/fpllm-ci,readonly" \
@@ -132,4 +173,34 @@ run_probe_trace() {
 run_probe_trace "$GOOD" fpllm-ci-probe-good clean
 run_probe_trace "$BAD" fpllm-ci-probe-bad materialized
 
-echo "causal-attention runtime image + fixture validation: PASS"
+# Produce explicit, non-secret inspection evidence for the split hidden-evaluation topology.
+TOPOLOGY_IPC="$TMP/topology-ipc"
+TOPOLOGY_OUTPUT="$TMP/topology-output"
+TOPOLOGY_PRIVATE="$TMP/topology-private"
+mkdir -p "$TOPOLOGY_IPC" "$TOPOLOGY_OUTPUT" "$TOPOLOGY_PRIVATE"
+chmod 733 "$TOPOLOGY_IPC" "$TOPOLOGY_OUTPUT"
+printf '%s\n' '# CI topology placeholder; production private evaluator bundle is never stored here.' > "$TOPOLOGY_PRIVATE/README.txt"
+
+docker run -d --name fpllm-ci-topology-learner \
+  "${sandbox_common[@]}" \
+  --mount="type=bind,source=$GOOD,target=/workspace,readonly" \
+  --mount="type=bind,source=$TOPOLOGY_IPC,target=/run/fpllm-ipc" \
+  --workdir=/workspace \
+  "$IMAGE" sleep 120 >/dev/null
+
+docker run -d --name fpllm-ci-topology-evaluator \
+  "${sandbox_common[@]}" \
+  --mount="type=bind,source=$TOPOLOGY_PRIVATE,target=/opt/fpllm/tests,readonly" \
+  --mount="type=bind,source=$TOPOLOGY_IPC,target=/run/fpllm-ipc" \
+  --mount="type=bind,source=$TOPOLOGY_OUTPUT,target=/output" \
+  --workdir=/opt/fpllm/tests \
+  "$EVALUATOR_IMAGE" sleep 120 >/dev/null
+
+python "$ROOT/scripts/ci/inspect_sandbox_topology.py" \
+  --learner-container fpllm-ci-topology-learner \
+  --evaluator-container fpllm-ci-topology-evaluator \
+  --output "$ARTIFACT_DIR/sandbox-topology.json"
+
+docker rm -f fpllm-ci-topology-learner fpllm-ci-topology-evaluator >/dev/null
+
+echo "causal-attention runtime image + fixture + topology validation: PASS"
