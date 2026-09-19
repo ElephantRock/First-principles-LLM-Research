@@ -164,17 +164,32 @@ jobs:
           echo "FPLLM_WORKER_TEMP_ROOT=$RUNNER_TEMP/fpllm-worker" >> "$GITHUB_ENV"
           echo "FPLLM_STAGING_EVIDENCE_PATH=$GITHUB_WORKSPACE/.artifacts/staging/staging-submission-e2e.json" >> "$GITHUB_ENV"
 
+      - name: Verify staging worker-host boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f scripts/ops/verify_worker_host.py
+          mkdir -p "$FPLLM_WORKER_TEMP_ROOT" .artifacts/staging
+          python scripts/ops/verify_worker_host.py \
+            --learner-image "$FPLLM_TEST_RUNTIME_IMAGE" \
+            --evaluator-image "$FPLLM_HIDDEN_EVALUATOR_IMAGE" \
+            --worker-temp-root "$FPLLM_WORKER_TEMP_ROOT" \
+            --public-bundle-root "$FPLLM_PUBLIC_TEST_BUNDLE_ROOT" \
+            --private-bundle-root "$FPLLM_PRIVATE_TEST_BUNDLE_ROOT" \
+            --output .artifacts/staging/worker-host-preflight.json
+
       - name: Execute real GitHub App -> worker -> Docker -> persisted evidence path
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$FPLLM_WORKER_TEMP_ROOT"
-          pnpm --dir packages/db exec tsx ../../apps/worker/src/staging.ts
+          test -x packages/db/node_modules/.bin/tsx
+          packages/db/node_modules/.bin/tsx apps/worker/src/staging.ts
 
       - name: Upload staging evidence
         uses: actions/upload-artifact@v4
         with:
           name: staging-submission-e2e-${{ github.run_id }}
-          path: .artifacts/staging/staging-submission-e2e.json
+          path: .artifacts/staging/
           if-no-files-found: error
           retention-days: 30

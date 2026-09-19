@@ -31,7 +31,7 @@ export class AuthenticationRequiredError extends Error {
 }
 
 export function sanitizeReturnTo(value: string | null | undefined): string {
-  if (!value || !value.startsWith("/") || value.startsWith("//")) return "/home";
+  if (!value || !value.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/home";
   if (value.startsWith("/auth/")) return "/home";
   return value;
 }

@@ -1,11 +1,12 @@
 import { prisma } from "./client";
 import { addMasteryEvidence, getCausalAttentionMastery, getDemoUser } from "./evidence";
+import { getLatestEnvironmentQualificationForUser } from "./environment";
 
 export async function getLearnerSnapshot(userId: string) {
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user) throw new Error("USER_NOT_FOUND");
-  const [compute, repository, submission, experiment, journal, mastery] = await Promise.all([
-    prisma.computeProfile.findFirst({ where: { userId }, orderBy: { createdAt: "desc" } }),
+  const [latestEnvironment, repository, submission, experiment, journal, mastery] = await Promise.all([
+    getLatestEnvironmentQualificationForUser(userId),
     prisma.repository.findFirst({ where: { userId }, orderBy: { createdAt: "desc" } }),
     prisma.submission.findFirst({
       where: { userId, labId: "phase1-causal-attention-lab" },
@@ -23,6 +24,9 @@ export async function getLearnerSnapshot(userId: string) {
     }),
     getCausalAttentionMastery(userId),
   ]);
+  const compute = latestEnvironment
+    ? latestEnvironment.computeProfile
+    : await prisma.computeProfile.findFirst({ where: { userId }, orderBy: { createdAt: "desc" } });
   return { user, compute, repository, submission, experiment, journal, mastery };
 }
 

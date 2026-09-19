@@ -3,7 +3,7 @@
 
 **Document version:** 1.2  
 **Date:** 2026-09-19  
-**Status:** AUTHORITATIVE DELTA OVER `PROJECT_DECISIONS.md` v1.1
+**Status:** AUTHORITATIVE DELTA OVER `PROJECT_DECISIONS.md` v1.1; POST-REVIEW EVIDENCE QUALIFICATION IN §8
 
 ---
 
@@ -19,6 +19,8 @@ PROJECT_DECISIONS.md v1.1
 ```
 
 Where this addendum conflicts with v1.1, **v1.2 supersedes v1.1**. All v1.1 decisions not revised here remain in force.
+
+Section 8 records a post-merge review correction and supersedes any broader verification wording elsewhere in this document where they conflict. In particular, implementation presence must not be read as production or real-external-flow verification unless the cited gate actually exercised that flow.
 
 The next full consolidated register should fold these decisions into the canonical `PROJECT_DECISIONS.md` rather than maintaining indefinite parallel deltas.
 
@@ -69,12 +71,14 @@ The active open items are now:
 5. **Payment/commerce — OPEN AND DEFERRED.**
 6. **Reviewer/instructor tooling — PARTIALLY DEFINED AND NOT A v0.5 REQUIREMENT.**
 7. **Hosted compute provider/integration — OPEN.**
+8. **Real GitHub App user-OAuth/PKCE repository-binding gate — OPEN EMPIRICAL TASK, REQUIRED AT v0.5 P2.**
+9. **Fresh-learner enrollment/track-selection path — OPEN IMPLEMENTATION TASK, REQUIRED AT v0.5 P2.**
 
 ---
 
-# 2. Verified platform baseline through v0.4 — FROZEN
+# 2. Platform implementation baseline through v0.4 — FROZEN
 
-The platform implementation sequence through v0.4 is now part of the authoritative baseline.
+The platform implementation sequence through v0.4 is part of the authoritative baseline. Verification language is limited by the evidence qualification in §8.
 
 ## 2.1 v0.1 — vertical-slice scaffold — VERIFIED
 
@@ -98,17 +102,17 @@ The invariant remains:
 }
 \]
 
-## 2.4 v0.4 — real learner identity and onboarding — VERIFIED
+## 2.4 v0.4 — real learner identity and onboarding — MERGED IMPLEMENTATION BASELINE / EVIDENCE QUALIFIED
 
-Platform v0.4 replaced seeded learner authority with request-scoped real learner identity while preserving the v0.3 execution/evidence boundary.
+Platform v0.4 replaced seeded learner authority in the web/control plane with request-scoped real learner identity while preserving the v0.3 execution/evidence boundary.
 
-Verified capabilities include:
+Implemented capabilities include:
 
 - GitHub OAuth human identity mapped by immutable numeric GitHub user ID;
 - opaque revocable server-side sessions with only token digests persisted;
 - request-scoped learner authorization;
 - two-user isolation across learner-owned evidence domains;
-- GitHub App repository onboarding using a separate repository-authorization proof;
+- GitHub App repository-onboarding code using a separate repository-authorization proof;
 - persisted environment qualification and selected 8/12/16 GB profile;
 - immutable 40-character commit submission;
 - queued/running/terminal submission status;
@@ -116,6 +120,11 @@ Verified capabilities include:
 - no-seed browser lifecycle coverage with demo fallback disabled;
 - desktop and mobile browser validation;
 - handoff from passing implementation evidence into the experiment flow.
+
+The frozen release evidence **does not establish** two claims that were stated too broadly in the initial v0.4 release record:
+
+1. it does not exercise the new GitHub App user-OAuth/PKCE repository-binding chain end to end against the real external flow; the browser gate binds through a production-disabled fixture and the v0.3 real staging evidence predates that chain;
+2. it does not implement or prove fresh-learner enrollment/track selection, despite that item appearing in the original v0.4 completion checklist.
 
 Frozen v0.4 release identities:
 
@@ -128,7 +137,7 @@ Frozen v0.4 release identities:
 
 ---
 
-# 3. Real learner identity and repository authorization — FROZEN
+# 3. Real learner identity and repository authorization — FROZEN DESIGN / IMPLEMENTATION CONTRACT
 
 The platform distinguishes human identity from repository execution authority.
 
@@ -172,6 +181,8 @@ Security requirements:
 7. repository execution resolves through the least-privilege GitHub App installation path;
 8. learner repository code never executes in the web process.
 
+This chain is frozen as the intended production authorization contract. Its real external end-to-end verification remains required by v0.5 P2.
+
 ---
 
 # 4. Platform v0.5 — Production Beta & Learner Validation — FROZEN OBJECTIVE
@@ -180,15 +191,15 @@ Platform v0.5 must prove the **learner experience**, not merely the platform mac
 
 The governing acceptance test is:
 
-> A previously unknown external learner can sign in, qualify their environment, bind their own authorized GitHub repository, implement Causal Attention, submit an immutable commit, receive real public/hidden evaluation, run the memory experiment, interpret the evidence, earn mastery, and write the result into the research journal on the deployed platform without fixture authority or privileged operator intervention.
+> A previously unknown external learner can sign in, select/record their course track, qualify their environment, bind their own authorized GitHub repository through the real GitHub App flow, implement Causal Attention, submit an immutable commit, receive real public/hidden evaluation, run the memory experiment, interpret the evidence, earn mastery, and write the result into the research journal on the deployed platform without fixture authority or privileged operator intervention.
 
 Governing progression:
 
 \[
 \boxed{
-\text{v0.4 proves the machinery}
+\text{v0.4 establishes the implementation baseline}
 \rightarrow
-\text{v0.5 proves the learner experience}
+\text{v0.5 proves the production learner experience}
 \rightarrow
 \text{expand the curriculum}
 }
@@ -201,6 +212,7 @@ Required scope:
 - production deployment of web, PostgreSQL, worker, and sandbox path;
 - explicit production provider decisions before infrastructure implementation;
 - real GitHub OAuth and GitHub App configuration;
+- fresh-learner enrollment/track selection;
 - production secret-management and rotation procedure;
 - migrations plus backup/restore procedure;
 - artifact storage if required by the experiment flow;
@@ -258,9 +270,18 @@ Explicitly record before production infrastructure implementation:
 
 A clean production environment can be provisioned from committed configuration/runbooks, migrations apply without manual database mutation, and backup restore + rollback have each been exercised.
 
-## P2 — real identity/repository
+## P2 — real identity, enrollment, and repository authorization
 
-With demo/E2E fixture authority disabled, a new learner can authenticate through GitHub OAuth, receive a normal session, bind only an authorized GitHub App repository, and sign out/revoke access correctly.
+With demo/E2E fixture authority disabled, a new learner must:
+
+1. authenticate through GitHub OAuth and receive a normal revocable session;
+2. select and persist a valid course track/enrollment;
+3. complete the real GitHub App user-OAuth/PKCE authorization proof;
+4. bind only a repository they are authorized to reach through the App;
+5. finalize the bind through installation authority and immutable repository identity;
+6. sign out and lose access to learner-owned resources.
+
+Fixture-only simulation is not sufficient evidence for P2.
 
 ## P3 — real execution/evidence
 
@@ -327,15 +348,52 @@ Only that frozen package may be called the verified v0.5 baseline.
 
 # 7. Revised current next-step sequence — v1.2
 
-1. Preserve this v1.2 addendum and `PLATFORM_PRODUCTION_BETA_v0.5.md` as the production-beta contract.
+1. Complete and merge the post-Codex remediation of outstanding v0.3/v0.4/v0.5 review findings, with green CI and review-thread disposition recorded.
 2. Complete **P0 provider/operations decisions** before production infrastructure implementation.
-3. Provision one production Causal Attention vertical slice; do not broaden curriculum scope yet.
-4. Prove P1–P5 with fixture/demo authority disabled in production.
-5. Run the external 3–5 learner beta and collect P6 evidence.
-6. Freeze P7 before calling the v0.5 beta baseline verified.
-7. Continue Phase 1 8/12/16 GB empirical certification and natural-language acceptance calibration in parallel.
-8. Write the detailed Phase 2 — Optimize specification in parallel, but defer broad Phase 2 implementation until v0.5 learner evidence exists.
-9. After v0.5 verification, expand the remaining Phase 1 units through the same evidence architecture.
+3. Implement the missing fresh-learner enrollment/track-selection path before attempting P2 verification.
+4. Provision one production Causal Attention vertical slice; do not broaden curriculum scope yet.
+5. Prove P1–P5 with fixture/demo authority disabled in production, including the real GitHub App user-OAuth/PKCE repository-binding path at P2.
+6. Run the external 3–5 learner beta and collect P6 evidence.
+7. Freeze P7 before calling the v0.5 beta baseline verified.
+8. Continue Phase 1 8/12/16 GB empirical certification and natural-language acceptance calibration in parallel.
+9. Write the detailed Phase 2 — Optimize specification in parallel, but defer broad Phase 2 implementation until v0.5 learner evidence exists.
+10. After v0.5 verification, expand the remaining Phase 1 units through the same evidence architecture.
+
+---
+
+# 8. Post-Codex review evidence qualification — AUTHORITATIVE CORRECTION
+
+A review of merged PRs #2, #7, and #8 found actionable Codex comments that had not been dispositioned before merge.
+
+The resulting project rule is:
+
+\[
+\boxed{
+\text{green CI}
+\neq
+\text{all review findings addressed}
+\neq
+\text{real-flow production verification}
+}
+\]
+
+The following corrections are authoritative:
+
+- v0.3 staging hardening must exist in every active staging release path, including worker-host preflight against the exact digest-pinned runtime images and repository-root-safe worker launch;
+- v0.4 release evidence is not evidence of the new GitHub App user-OAuth/PKCE repository-binding chain because the no-seed browser gate used a production-disabled repository fixture;
+- v0.4 did not implement the original fresh-learner enrollment/track-selection criterion;
+- post-v0.4 remediation must cover unsafe OAuth return-path parsing, environment-report/compute-profile pairing, and learner-visible session revocation;
+- unresolved review comments must be explicitly dispositioned before future release PRs are merged.
+
+Future release procedure therefore requires, before merge:
+
+1. CI/release gates green for the exact candidate;
+2. all automated and human review threads inspected;
+3. each actionable finding fixed or explicitly rejected with evidence/rationale;
+4. affected tests/gates rerun;
+5. unresolved threads closed only after the disposition is recorded.
+
+This section supersedes any broader wording in §2.4 or historical v0.4 documentation.
 
 ---
 

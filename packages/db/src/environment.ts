@@ -289,7 +289,16 @@ export async function getLatestEnvironmentQualificationForUser(userId: string) {
   };
   const qualification = qualifyEnvironment(input);
   const computeProfile = environmentReport.selectedProfile
-    ? await prisma.computeProfile.findFirst({ where: { userId }, orderBy: { createdAt: "desc" } })
+    ? await prisma.computeProfile.findFirst({
+        where: {
+          userId,
+          evidenceJson: {
+            path: ["environmentReportId"],
+            equals: environmentReport.id,
+          },
+        },
+        orderBy: { createdAt: "desc" },
+      })
     : null;
 
   return { environmentReport, computeProfile, qualification };

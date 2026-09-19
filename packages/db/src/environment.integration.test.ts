@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { prisma } from "./client";
-import { qualifyEnvironment, recordEnvironmentReportForUser } from "./environment";
+import { getLatestEnvironmentQualificationForUser, qualifyEnvironment, recordEnvironmentReportForUser } from "./environment";
+import { getLearnerSnapshot } from "./repositories";
 
 const GIB = 1024 ** 3;
 
@@ -72,6 +73,47 @@ test("authenticated environment evidence creates a learner-owned compute profile
     assert.equal(computeProfile.gradScaler, true);
     assert.equal(computeProfile.cudaAvailable, true);
     assert.equal(computeProfile.vramGiB, 10);
+  } finally {
+    await prisma.computeProfile.deleteMany({ where: { userId: user.id } });
+    await prisma.environmentReport.deleteMany({ where: { userId: user.id } });
+    await prisma.auditEvent.deleteMany({ where: { actorUserId: user.id } });
+    await prisma.user.delete({ where: { id: user.id } });
+  }
+});
+
+test("latest qualification and learner snapshot use the compute profile produced by the selected captured report", async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const user = await prisma.user.create({ data: { handle: `environment-order-${suffix}` } });
+
+  try {
+    const current = await recordEnvironmentReportForUser(user.id, {
+      ...baseInput(),
+      gpuModel: "Current GPU",
+      selectedProfile: "8gb",
+      capturedAt: "2026-09-19T12:00:00.000Z",
+    });
+    const olderUploadedLater = await recordEnvironmentReportForUser(user.id, {
+      ...baseInput(),
+      gpuModel: "Older GPU",
+      selectedProfile: "12gb",
+      totalVramBytes: 16 * GIB,
+      bf16Supported: true,
+      capturedAt: "2026-09-18T12:00:00.000Z",
+    });
+
+    assert.notEqual(current.computeProfileId, olderUploadedLater.computeProfileId);
+
+    const latest = await getLatestEnvironmentQualificationForUser(user.id);
+    assert.ok(latest);
+    assert.equal(latest.environmentReport.id, current.environmentReportId);
+    assert.equal(latest.environmentReport.gpuModel, "Current GPU");
+    assert.equal(latest.computeProfile?.id, current.computeProfileId);
+    assert.equal(latest.computeProfile?.selectedProfile, "8gb");
+    assert.equal(latest.qualification.selectedProfile, "8gb");
+
+    const snapshot = await getLearnerSnapshot(user.id);
+    assert.equal(snapshot.compute?.id, current.computeProfileId);
+    assert.equal(snapshot.compute?.selectedProfile, "8gb");
   } finally {
     await prisma.computeProfile.deleteMany({ where: { userId: user.id } });
     await prisma.environmentReport.deleteMany({ where: { userId: user.id } });
