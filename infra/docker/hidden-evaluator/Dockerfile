@@ -1,4 +1,14 @@
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+
+ARG SOURCE_COMMIT=unknown
+
+LABEL org.opencontainers.image.source="https://github.com/ElephantRock/First-principles-LLM-Research" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.title="FPLLM hidden evaluator runtime" \
+      io.fpllm.runtime-role="hidden-evaluator" \
+      io.fpllm.test-bundle="phase1-causal-attention@1.0" \
+      io.fpllm.adapter-interface="causal-attention-v1" \
+      io.fpllm.memory-trace-schema="2"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
