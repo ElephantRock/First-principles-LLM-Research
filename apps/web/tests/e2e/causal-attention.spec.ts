@@ -6,7 +6,7 @@ const BASE_URL = "http://127.0.0.1:3000";
 type FixtureMode = "demo" | "fresh";
 
 async function authenticate(context: BrowserContext, mode: FixtureMode) {
-  const response = await context.request.post(`${BASE_URL}/api/v1/__test__/session`, {
+  const response = await context.request.post(`${BASE_URL}/api/v1/e2e/session`, {
     data: { mode },
   });
   expect(response.status()).toBe(201);
@@ -21,12 +21,12 @@ async function authenticate(context: BrowserContext, mode: FixtureMode) {
 }
 
 async function signOut(context: BrowserContext) {
-  const response = await context.request.delete(`${BASE_URL}/api/v1/__test__/session`);
+  const response = await context.request.delete(`${BASE_URL}/api/v1/e2e/session`);
   expect(response.status()).toBe(200);
 }
 
 async function learnerFixture(context: BrowserContext, data: Record<string, unknown>) {
-  return context.request.post(`${BASE_URL}/api/v1/__test__/learner-fixture`, { data });
+  return context.request.post(`${BASE_URL}/api/v1/e2e/learner-fixture`, { data });
 }
 
 test("vertical slice uses a real bearer session rather than demo auth fallback", async ({ page, context }) => {
