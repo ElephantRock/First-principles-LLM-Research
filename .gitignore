@@ -8,4 +8,5 @@ coverage/
 !.env.example
 playwright-report/
 test-results/
+.artifacts/
 .DS_Store

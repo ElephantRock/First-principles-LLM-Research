@@ -36,7 +36,7 @@ export async function getCausalAttentionMastery(userId: string) {
     },
     orderBy: { createdAt: "asc" },
   });
-  const passed = new Set(evidence.map((item) => item.dimension));
+  const passed = new Set(evidence.map((item: { dimension: string }) => item.dimension));
   const dimensions = Object.fromEntries(
     REQUIRED_MASTERY_DIMENSIONS.map((dimension) => [dimension, passed.has(dimension) ? "passed" : "pending"]),
   ) as Record<MasteryDimension, "passed" | "pending">;

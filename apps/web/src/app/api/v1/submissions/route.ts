@@ -1,19 +1,66 @@
 import { submissionCreateSchema } from "@fpllm/api-contracts";
-import { createSubmissionForDemo } from "@fpllm/db";
+import {
+  createVerifiedSubmissionAndQueueForDemo,
+  getBoundRepositoryIdentityForDemo,
+} from "@fpllm/db";
+import { GitHubAppClient } from "@fpllm/github";
 import { NextResponse } from "next/server";
+
+function githubClient() {
+  const appId = process.env.GITHUB_APP_ID;
+  const privateKey = process.env.GITHUB_APP_PRIVATE_KEY?.replaceAll("\\n", "\n");
+  if (!appId || !privateKey) throw new Error("GITHUB_APP_NOT_CONFIGURED");
+  return new GitHubAppClient({ appId, privateKey });
+}
 
 export async function POST(request: Request) {
   const parsed = submissionCreateSchema.safeParse(await request.json());
-  if (!parsed.success) return NextResponse.json({ ok: false, code: "REQUEST_INVALID", errors: parsed.error.flatten() }, { status: 400 });
+  if (!parsed.success) {
+    return NextResponse.json(
+      { ok: false, code: "REQUEST_INVALID", errors: parsed.error.flatten() },
+      { status: 400 },
+    );
+  }
+
   try {
-    const submission = await createSubmissionForDemo({
-      repositoryId: parsed.data.repositoryId,
+    const requestedCommit = parsed.data.commit.toLowerCase();
+    const repository = await getBoundRepositoryIdentityForDemo(parsed.data.repositoryId);
+    const resolved = await githubClient().resolveRepository({
+      installationId: repository.installationId,
+      owner: repository.owner,
+      repo: repository.name,
+      ref: requestedCommit,
+    });
+
+    if (resolved.commitSha.toLowerCase() !== requestedCommit) {
+      throw new Error("COMMIT_IDENTITY_MISMATCH");
+    }
+    if (
+      repository.providerRepositoryId !== null &&
+      String(resolved.repositoryId) !== repository.providerRepositoryId
+    ) {
+      throw new Error("REPOSITORY_IDENTITY_MISMATCH");
+    }
+
+    const queued = await createVerifiedSubmissionAndQueueForDemo({
+      repositoryId: repository.repositoryDbId,
       branch: parsed.data.branch,
-      commitSha: parsed.data.commit.toLowerCase(),
+      commitSha: resolved.commitSha.toLowerCase(),
       labVersion: parsed.data.labVersion,
     });
-    return NextResponse.json({ ok: true, submission }, { status: 201 });
+
+    return NextResponse.json(
+      {
+        ok: true,
+        submission: queued.submission,
+        testRun: queued.testRun,
+        job: queued.job,
+      },
+      { status: 202 },
+    );
   } catch (error) {
-    return NextResponse.json({ ok: false, code: "SUBMISSION_CREATE_FAILED", message: error instanceof Error ? error.message : "Unknown error" }, { status: 409 });
+    const code = error instanceof Error ? error.message : "SUBMISSION_CREATE_FAILED";
+    const status = code === "GITHUB_APP_NOT_CONFIGURED" ? 503 : 409;
+    return NextResponse.json({ ok: false, code }, { status });
   }
 }
