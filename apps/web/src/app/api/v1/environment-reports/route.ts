@@ -2,9 +2,28 @@ import { environmentReportSchema } from "@fpllm/api-contracts";
 import {
   getLatestEnvironmentQualificationForUser,
   recordEnvironmentReportForUser,
+  type EnvironmentReportInput,
 } from "@fpllm/db";
 import { NextResponse } from "next/server";
 import { getCurrentLearner } from "@/lib/auth";
+
+function toEnvironmentReportInput(input: ReturnType<typeof environmentReportSchema.parse>): EnvironmentReportInput {
+  return {
+    capturedAt: input.capturedAt,
+    report: input.report,
+    ...(input.pythonVersion === undefined ? {} : { pythonVersion: input.pythonVersion }),
+    ...(input.pytorchVersion === undefined ? {} : { pytorchVersion: input.pytorchVersion }),
+    ...(input.operatingSystem === undefined ? {} : { operatingSystem: input.operatingSystem }),
+    ...(input.cudaVersion === undefined ? {} : { cudaVersion: input.cudaVersion }),
+    ...(input.cudaAvailable === undefined ? {} : { cudaAvailable: input.cudaAvailable }),
+    ...(input.gpuModel === undefined ? {} : { gpuModel: input.gpuModel }),
+    ...(input.totalVramBytes === undefined ? {} : { totalVramBytes: input.totalVramBytes }),
+    ...(input.bf16Supported === undefined ? {} : { bf16Supported: input.bf16Supported }),
+    ...(input.selectedProfile === undefined ? {} : { selectedProfile: input.selectedProfile }),
+    ...(input.fpllmVersion === undefined ? {} : { fpllmVersion: input.fpllmVersion }),
+    ...(input.repositoryCommit === undefined ? {} : { repositoryCommit: input.repositoryCommit }),
+  };
+}
 
 export async function GET() {
   const current = await getCurrentLearner();
@@ -40,6 +59,6 @@ export async function POST(request: Request) {
     );
   }
 
-  const result = await recordEnvironmentReportForUser(current.user.id, parsed.data);
+  const result = await recordEnvironmentReportForUser(current.user.id, toEnvironmentReportInput(parsed.data));
   return NextResponse.json({ ok: true, ...result }, { status: 201 });
 }
