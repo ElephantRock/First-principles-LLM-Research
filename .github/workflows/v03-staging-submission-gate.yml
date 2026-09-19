@@ -150,6 +150,7 @@ jobs:
         run: |
           set -euo pipefail
           test -f apps/worker/src/staging.ts
+          test -f scripts/ops/verify_worker_host.py
           test -f scripts/staging/materialize_private_bundle.py
           test -f hidden-tests/phase1/causal-attention/private-bundle-commitment.json
 
@@ -193,6 +194,19 @@ jobs:
           echo "FPLLM_WORKER_TEMP_ROOT=$RUNNER_TEMP/fpllm-worker" >> "$GITHUB_ENV"
           echo "FPLLM_STAGING_EVIDENCE_PATH=$GITHUB_WORKSPACE/.artifacts/staging/staging-submission-e2e.json" >> "$GITHUB_ENV"
 
+      - name: Verify staging worker-host boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$FPLLM_WORKER_TEMP_ROOT" .artifacts/staging
+          python scripts/ops/verify_worker_host.py \
+            --learner-image "$FPLLM_TEST_RUNTIME_IMAGE" \
+            --evaluator-image "$FPLLM_HIDDEN_EVALUATOR_IMAGE" \
+            --worker-temp-root "$FPLLM_WORKER_TEMP_ROOT" \
+            --public-bundle-root "$FPLLM_PUBLIC_TEST_BUNDLE_ROOT" \
+            --private-bundle-root "$FPLLM_PRIVATE_TEST_BUNDLE_ROOT" \
+            --output .artifacts/staging/worker-host-preflight.json
+
       - name: Execute real GitHub App -> worker -> Docker -> persisted evidence path
         shell: bash
         run: |
@@ -223,6 +237,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: v03-staging-submission-gate-${{ github.run_id }}
-          path: .artifacts/staging/staging-submission-e2e.json
+          path: .artifacts/staging/
           if-no-files-found: error
           retention-days: 30
