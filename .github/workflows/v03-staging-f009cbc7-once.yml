@@ -154,7 +154,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pnpm --dir packages/db exec tsx ../../apps/worker/src/staging.ts
+          test -x packages/db/node_modules/.bin/tsx
+          packages/db/node_modules/.bin/tsx apps/worker/src/staging.ts
 
       - name: Bind both staging artifacts to frozen candidate
         shell: bash
