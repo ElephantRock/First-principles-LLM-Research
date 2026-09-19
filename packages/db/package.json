@@ -8,9 +8,9 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",
-    "typecheck": "prisma generate && tsc --noEmit",
-    "test": "prisma generate && tsx --test src/auth.integration.test.ts src/jobs.integration.test.ts src/evidence-flow.integration.test.ts",
-    "lint": "prisma generate && tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/auth.integration.test.ts src/jobs.integration.test.ts src/evidence-flow.integration.test.ts",
+    "lint": "tsc --noEmit"
   },
   "dependencies": {
     "@prisma/adapter-pg": "7.10.0",
