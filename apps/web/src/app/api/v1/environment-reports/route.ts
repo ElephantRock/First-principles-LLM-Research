@@ -1,11 +1,36 @@
 import { environmentReportSchema } from "@fpllm/api-contracts";
-import { prisma } from "@fpllm/db";
+import {
+  getLatestEnvironmentQualificationForUser,
+  recordEnvironmentReportForUser,
+} from "@fpllm/db";
 import { NextResponse } from "next/server";
 import { getCurrentLearner } from "@/lib/auth";
 
+export async function GET() {
+  const current = await getCurrentLearner();
+  if (!current) {
+    return NextResponse.json({ ok: false, code: "AUTHENTICATION_REQUIRED" }, { status: 401 });
+  }
+
+  const latest = await getLatestEnvironmentQualificationForUser(current.user.id);
+  if (!latest) return NextResponse.json({ ok: true, environment: null });
+
+  return NextResponse.json({
+    ok: true,
+    environment: {
+      environmentReportId: latest.environmentReport.id,
+      computeProfileId: latest.computeProfile?.id ?? null,
+      capturedAt: latest.environmentReport.capturedAt.toISOString(),
+      qualification: latest.qualification,
+    },
+  });
+}
+
 export async function POST(request: Request) {
   const current = await getCurrentLearner();
-  if (!current) return NextResponse.json({ ok: false, code: "AUTHENTICATION_REQUIRED" }, { status: 401 });
+  if (!current) {
+    return NextResponse.json({ ok: false, code: "AUTHENTICATION_REQUIRED" }, { status: 401 });
+  }
 
   const parsed = environmentReportSchema.safeParse(await request.json());
   if (!parsed.success) {
@@ -15,23 +40,6 @@ export async function POST(request: Request) {
     );
   }
 
-  const row = await prisma.environmentReport.create({
-    data: {
-      userId: current.user.id,
-      pythonVersion: parsed.data.pythonVersion ?? null,
-      pytorchVersion: parsed.data.pytorchVersion ?? null,
-      operatingSystem: parsed.data.operatingSystem ?? null,
-      cudaVersion: parsed.data.cudaVersion ?? null,
-      gpuModel: parsed.data.gpuModel ?? null,
-      totalVramBytes: parsed.data.totalVramBytes == null ? null : BigInt(parsed.data.totalVramBytes),
-      bf16Supported: parsed.data.bf16Supported ?? null,
-      selectedProfile: parsed.data.selectedProfile ?? null,
-      fpllmVersion: parsed.data.fpllmVersion ?? null,
-      repositoryCommit: parsed.data.repositoryCommit ?? null,
-      reportJson: JSON.parse(JSON.stringify(parsed.data.report)),
-      capturedAt: new Date(parsed.data.capturedAt),
-    },
-  });
-
-  return NextResponse.json({ ok: true, environmentReportId: row.id }, { status: 201 });
+  const result = await recordEnvironmentReportForUser(current.user.id, parsed.data);
+  return NextResponse.json({ ok: true, ...result }, { status: 201 });
 }
