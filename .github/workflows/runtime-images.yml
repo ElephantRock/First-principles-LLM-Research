@@ -25,8 +25,7 @@ jobs:
       FPLLM_SOURCE_COMMIT: ${{ github.sha }}
       LEARNER_LOCAL_IMAGE: fpllm/test-runtime:ci
       EVALUATOR_LOCAL_IMAGE: fpllm/hidden-evaluator:ci
-      LEARNER_REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/fpllm-test-runtime
-      EVALUATOR_REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/fpllm-hidden-evaluator
+      REGISTRY_NAMESPACE: ${{ github.repository_owner }}
 
     steps:
       - name: Checkout selected immutable source revision
@@ -62,6 +61,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          namespace="${REGISTRY_NAMESPACE,,}"
+          export LEARNER_REGISTRY_IMAGE="ghcr.io/${namespace}/fpllm-test-runtime"
+          export EVALUATOR_REGISTRY_IMAGE="ghcr.io/${namespace}/fpllm-hidden-evaluator"
           short_sha="${FPLLM_SOURCE_COMMIT:0:12}"
           learner_tag="${LEARNER_REGISTRY_IMAGE}:rc-${short_sha}"
           evaluator_tag="${EVALUATOR_REGISTRY_IMAGE}:rc-${short_sha}"
@@ -71,6 +73,10 @@ jobs:
           docker push "$learner_tag"
           docker push "$evaluator_tag"
 
+          # Pull after publication so RepoDigests is populated from the registry,
+          # rather than assuming a local tag is equivalent to distributed identity.
+          docker pull "$learner_tag" >/dev/null
+          docker pull "$evaluator_tag" >/dev/null
           learner_ref="$(docker image inspect "$learner_tag" --format '{{index .RepoDigests 0}}')"
           evaluator_ref="$(docker image inspect "$evaluator_tag" --format '{{index .RepoDigests 0}}')"
           learner_digest="${learner_ref##*@}"
