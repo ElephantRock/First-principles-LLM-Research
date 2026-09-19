@@ -4,59 +4,59 @@
 **Date:** 2026-09-20  
 **Baseline:** `aa88e7ccb7f15e9105226ab4b9262c6dbe864f41`  
 **Governing contract:** `PLATFORM_PRODUCTION_BETA_v0.5.md` §5  
-**Authority:** this is the linked v0.5 P0 decision record contemplated by the governing contract. It supersedes `PROJECT_DECISIONS_v1.2.md` §1.4 item 4 only with respect to whether v0.5 production-provider selection remains open. It does not supersede any frozen security, evidence, learner, or release-gate invariant.
+**Authority:** linked v0.5 P0 decision record contemplated by the governing contract. It supersedes `PROJECT_DECISIONS_v1.2.md` §1.4 item 4 only with respect to whether v0.5 production-provider selection remains open. It does not supersede any frozen security, evidence, learner, or release-gate invariant.
 
 ---
 
-## 0. Gate outcome
+## 0. Gate outcome and evidence boundary
 
-Platform v0.5 P0 is **CLOSED by decision** when this record is merged.
+Platform v0.5 P0 is **CLOSED by decision when this record is merged**.
 
-This document selects the production provider/operations baseline required before infrastructure implementation. It does **not** claim that any production resource has been provisioned, any credential has been created, any real OAuth/App callback has succeeded, any backup has been restored, or any P1–P7 gate has passed.
+This record selects the production provider/operations baseline required before infrastructure implementation. It does **not** claim that production resources exist, credentials have been created, real OAuth/App callbacks have succeeded, backups have been restored, or any P1–P7 gate has passed.
 
-The production baseline is deliberately small: one Causal Attention vertical slice for an initial 3–5 learner beta, with at least three independent full-loop completions required by the governing v0.5 contract.
+The production baseline remains deliberately small: one complete Causal Attention vertical slice for an initial 3–5 learner beta, with at least three independent full-loop external completions required by the governing v0.5 contract.
+
+P0 closes provider selection against the published provider envelope recorded below. Account-specific applied quotas are not publicly inferable, so P1 starts with a **no-create quota/availability admission check**. If an applied quota is below the frozen minimum and cannot be raised without changing the selected architecture, production provisioning stops and P0 is reopened by committed amendment. No silent provider/hosting fallback is permitted.
 
 ---
 
-## 1. Decision summary
+## 1. Frozen decision summary
 
-| P0 decision | Frozen selection | Gate status |
+| P0 decision | Frozen selection | Status |
 |---|---|---|
 | Infrastructure provider / region | Amazon Web Services, `eu-west-1` (Europe/Ireland) | CLOSED |
 | Web/runtime hosting | Amazon ECS Express Mode on Fargate, service `fpllm-beta-web`, 1 vCPU / 2 GiB per task, min 1 / max 2 tasks | CLOSED |
 | PostgreSQL | Amazon RDS for PostgreSQL 18.6, Single-AZ `db.t3.small`, encrypted `gp3`, 20 GiB initial | CLOSED |
-| Learner artifact object storage | **Not required for the first v0.5 beta**; bounded authoritative structured evidence remains in PostgreSQL | CLOSED |
-| Container registry | Private Amazon ECR repositories; production images referenced by immutable digest | CLOSED |
-| Worker host | Amazon EC2 `m7i.xlarge`, one On-Demand x86_64 worker host, desired concurrency 1 | CLOSED |
-| Sandbox isolation | Docker Engine + gVisor `runsc`, preserving current network/filesystem/capability/user/resource boundaries | CLOSED |
-| Hidden evaluator distribution | Private digest-pinned ECR hidden-evaluator image containing the private evaluator bundle; no hidden bundle in web image or learner mount namespace | CLOSED |
-| Observability | Amazon CloudWatch Logs/Metrics/Alarms + AWS X-Ray through OpenTelemetry/ADOT where trace instrumentation is present | CLOSED |
+| Learner artifact object storage | **Not required for the first v0.5 beta**; bounded structured evidence remains in PostgreSQL | CLOSED |
+| Container registry | Private Amazon ECR; production images referenced by immutable digest | CLOSED |
+| Worker host | Amazon EC2 `m7i.xlarge`, one On-Demand x86_64 worker host, ASG min/desired/max = 1/1/1 | CLOSED |
+| Sandbox isolation | Docker Engine + gVisor `runsc`, preserving the frozen network/filesystem/capability/user/resource boundaries | CLOSED |
+| Hidden evaluator distribution | Private digest-pinned ECR evaluator image containing the private evaluator bundle; no hidden bundle in web image or learner mount namespace | CLOSED |
+| Observability | CloudWatch Logs/Metrics/Alarms + AWS X-Ray through OpenTelemetry/ADOT where trace instrumentation exists | CLOSED |
 | Secrets | AWS Secrets Manager + KMS, workload IAM roles, no long-lived AWS runtime access keys | CLOSED |
 | Canonical production origin | `https://fpllm-beta-web.ecs.eu-west-1.on.aws` | CLOSED |
-| DNS/TLS | Initial beta uses the AWS-managed ECS Express `on.aws` hostname and managed certificate; no custom domain | CLOSED |
+| DNS/TLS | AWS-managed ECS Express `on.aws` hostname and managed certificate; no custom domain for v0.5 | CLOSED |
 | Backup/restore | RDS automated backups/PITR, 7-day retention, pre-migration snapshots, restore-to-new-instance drill | CLOSED |
-| Release process | GitHub Actions OIDC -> AWS IAM; AWS CDK v2/TypeScript IaC; immutable ECR digests; expand-first migrations; canary web deploy; explicit smoke/rollback gate | CLOSED |
+| Release process | GitHub Actions OIDC -> AWS IAM; AWS CDK v2/TypeScript; immutable ECR digests; expand-first migrations; canary web deploy; smoke/rollback gate | CLOSED |
 
-P1 starts from this table. Any change to a row before P7 requires a committed decision amendment that explains why the original assumption failed.
+Any change to a CLOSED row before P7 requires a committed decision amendment explaining the failed assumption and all consequential changes.
 
 ---
 
-## 2. Why AWS and `eu-west-1`
+## 2. Provider and region
 
-### 2.1 Architecture fit
+### 2.1 Why AWS
 
-The frozen platform already separates:
+The frozen platform requires:
 
 ```text
-web/control plane
-!=
-learner-code execution process
+web/control plane != learner-code execution process
 ```
 
-AWS supports that separation without introducing a second infrastructure provider:
+The selected topology keeps those trust domains separate while using one infrastructure provider:
 
 ```text
-ECS Express/Fargate web
+ECS Express / Fargate web
         |
         v
 RDS PostgreSQL 18
@@ -71,30 +71,77 @@ EC2 trusted worker host
 Docker + gVisor ephemeral sandboxes
 ```
 
-ECR, Secrets Manager, CloudWatch, X-Ray, IAM, Systems Manager, and the VPC remain in the same account/region and can be permissioned independently.
+ECR, Secrets Manager, CloudWatch, X-Ray, IAM, Systems Manager, and the VPC remain separately permissionable services in the same AWS account/region.
+
+AWS App Runner is not selected. AWS documents that it stopped accepting new customers on 2026-03-31 and points comparable users toward ECS Express Mode.
 
 ### 2.2 Region
 
-Primary production compute and data are placed in **`eu-west-1` (Europe/Ireland)** for the first beta.
+Primary production compute and data are placed in **`eu-west-1`**.
 
 Implications:
 
-- production RDS data, application logs, ECR images, and AWS-managed secrets are region-scoped to `eu-west-1` unless the service itself uses a documented global control plane;
-- GitHub remains a separate external dependency for identity, repository authorization, and source retrieval;
+- RDS data, application logs, ECR images, and AWS-managed secrets are region-scoped to `eu-west-1` unless a service has a documented global control plane;
+- GitHub remains an external dependency for identity, repository authorization, and source retrieval;
 - v0.5 does not claim cross-region disaster recovery or a specific legal data-residency certification;
-- moving regions later is an infrastructure migration, not an application-architecture rewrite.
-
-### 2.3 Rejected primary web option
-
-AWS App Runner is not selected. AWS states that App Runner stopped accepting new customers on 2026-03-31 and recommends ECS Express Mode as the migration/successor path for comparable operational simplicity.
+- moving regions later is an infrastructure/data migration, not a rewrite of learner evidence semantics.
 
 ---
 
-## 3. Network baseline
+## 3. Provider limits and P1 admission envelope
 
-P1 must provision one production VPC in `eu-west-1`, nominal CIDR `10.42.0.0/16`, with at least two Availability Zones.
+The governing P0 contract requires hard provider limits that can affect the learner loop. The following published limits/default quotas and v0.5 consumption envelope are therefore part of the frozen decision.
 
-Initial beta network shape:
+Published defaults are **not equivalent to the account's applied quotas**. P1 must query the actual account before creating resources. If a minimum below is not available, resource creation is blocked until an approved quota increase succeeds or a P0 amendment is merged.
+
+| Service / limit | Published default or hard limit checked at freeze | v0.5 requirement / minimum |
+|---|---:|---:|
+| Fargate On-Demand vCPU quota per region | 6 vCPU default, adjustable | Applied quota **>= 6 vCPU** before web/migration provisioning |
+| Fargate On-Demand sustained launch rate in `eu-west-1` | 20 tasks/sec, adjustable | Far above beta launch demand |
+| ECS services per cluster | 5,000, non-adjustable | 1 Express web service |
+| ECS tasks per service | 5,000, non-adjustable | max 2 steady-state web tasks; canary overlap must remain within applied Fargate quota |
+| Security groups per ECS `awsvpcConfiguration` | 5, non-adjustable | <= 5; target design uses the minimum required set |
+| Subnets per ECS `awsvpcConfiguration` | 16, non-adjustable | 2+ web subnets, never >16 |
+| Application Load Balancers per region | 50 default, adjustable | 1 Express-managed ALB |
+| VPCs per region | 5 default, adjustable | 1 production VPC |
+| Subnets per VPC | 200 default | at least 4 production subnets |
+| Running On-Demand Standard EC2 vCPUs | 5 vCPU default, adjustable | Applied quota **>= 4 vCPU** for one `m7i.xlarge` |
+| RDS DB instances per region | 40 default, adjustable | max 2 simultaneously during restore drill: production + restored target |
+| RDS manual DB snapshots | 100 default, adjustable | bounded release/drill snapshots, <<100 |
+| RDS total storage across DB instances | 100,000 GiB default, adjustable | <=200 GiB if production and restored instance are both at the frozen 100 GiB autoscaling ceiling |
+| RDS DB subnets per subnet group | 20, non-adjustable | 2+ private DB subnets |
+
+### 3.1 Fargate quota interpretation
+
+The steady web ceiling is 2 vCPU because there are at most two 1-vCPU tasks. Canary replacement can temporarily increase task count, and the migration task also consumes Fargate capacity. Therefore the frozen admission minimum is **6 applied Fargate On-Demand vCPU**, and the release process must not intentionally schedule a migration task concurrently with a canary if doing so would exceed the observed applied quota.
+
+P1 records both the AWS-published default and the actual account-applied Fargate quota before creating ECS resources.
+
+### 3.2 EC2 quota interpretation
+
+One `m7i.xlarge` consumes 4 Standard On-Demand vCPUs. The published default Standard On-Demand quota is 5 vCPU, so the initial worker Auto Scaling Group is deliberately frozen at:
+
+```text
+min = 1
+desired = 1
+max = 1
+```
+
+At that default, worker image/AMI replacement must be **terminate-then-launch**, accepting a brief worker-unavailable interval while durable PostgreSQL jobs remain queued/retryable. Zero-downtime overlap of two `m7i.xlarge` hosts is not permitted unless the applied Standard On-Demand quota is first raised to at least 8 vCPU and the operational change is recorded.
+
+P1 must verify actual applied Standard On-Demand vCPU quota >=4 before creating the worker.
+
+### 3.3 Quota failure rule
+
+The first P1 production action is a read-only quota/availability report covering Fargate, EC2, RDS, ALB/VPC requirements and selected-region product availability. A failed minimum is a **hard provisioning stop**, not permission to substitute another provider/product. If the selected service cannot meet the frozen requirement, P0 is reopened and amended before implementation continues.
+
+---
+
+## 4. Network baseline
+
+P1 provisions one VPC in `eu-west-1`, nominal CIDR `10.42.0.0/16`, spanning at least two Availability Zones.
+
+Initial topology:
 
 ```text
 Internet
@@ -116,27 +163,39 @@ EC2 worker in public subnet
 (no inbound rules; outbound only as required)
 ```
 
-The public-subnet choice for web tasks and the worker is intentional for the small beta: it avoids a continuously billed NAT gateway while retaining security-group control. Public IP assignment is **not** authority to accept arbitrary inbound traffic.
+Public subnets are used for the small beta to avoid a continuously billed NAT gateway. Public IP assignment is not authority to accept arbitrary inbound traffic.
 
-Required security-group policy:
+Required security policy:
 
 - ALB: public inbound HTTPS only;
-- web tasks: inbound application port only from the Express/ALB security group; no direct public application ingress;
-- RDS: no public endpoint; PostgreSQL/5432 allowed only from the web and worker security groups;
-- worker: no inbound rules; administration through AWS Systems Manager Session Manager only;
-- no SSH key or port 22 production access path.
+- web tasks: application-port inbound only from the Express/ALB path; no direct application ingress;
+- RDS: no public endpoint; PostgreSQL/5432 only from the web and worker security groups;
+- worker: no inbound rules; administration through Systems Manager Session Manager only;
+- no production SSH key or port-22 path.
 
-If P1 evidence shows that Express Mode cannot express the required security-group topology without weakening these rules, use standard ECS/Fargate with an ALB in the same AWS region rather than weakening the rules. That is an implementation-mode fallback, not permission to collapse web and worker trust boundaries.
+### 4.1 Express network incompatibility rule
+
+If P1 proves ECS Express Mode cannot satisfy the mandatory network/security-group topology without weakening a frozen invariant, **stop and reopen P0 before provisioning the replacement web stack**.
+
+Standard ECS/Fargate with a conventional ALB may be evaluated, but it is **not a transparent implementation fallback**. A replacement decision must explicitly freeze, at minimum:
+
+- replacement canonical HTTPS origin;
+- DNS ownership and TLS certificate lifecycle;
+- both GitHub OAuth/GitHub App callback URLs;
+- ingress/subnet/security-group topology;
+- deployment/canary and rollback behavior;
+- observability consequences;
+- revised cost/limit envelope.
+
+No P1 implementation may proceed under another hosting mode until that amendment is merged.
 
 ---
 
-## 4. Web/runtime hosting
+## 5. Web/runtime hosting
 
-### 4.1 Product
+Use **Amazon ECS Express Mode backed by Fargate**.
 
-Use **Amazon ECS Express Mode** backed by AWS Fargate.
-
-Frozen service identity:
+Frozen service configuration:
 
 ```text
 service: fpllm-beta-web
@@ -149,13 +208,11 @@ container port: 3000
 health path: /api/healthz
 ```
 
-`/api/healthz` is a P1 implementation requirement; it must return success only when the web process is serving and its required control-plane dependencies pass the deliberately defined health policy.
+`/api/healthz` is a P1 implementation requirement. Its exact dependency semantics must be defined deliberately so a health check neither hides required dependency failure nor causes cascading restarts for an unrelated external outage.
 
-AWS documents that Express Mode provisions a Fargate ECS service, HTTPS load balancing, auto scaling, CloudWatch integration, an AWS-managed application URL, and canary updates with alarm-based rollback.
+AWS documents ECS Express as provisioning a Fargate ECS service with HTTPS load balancing, autoscaling, CloudWatch integration, an AWS-managed application URL, and canary updates with alarm-based rollback.
 
-### 4.2 Production origin and callbacks
-
-The service name is fixed because ECS Express uses it in the application URL.
+### 5.1 Production origin and callbacks
 
 Canonical origin:
 
@@ -163,7 +220,7 @@ Canonical origin:
 https://fpllm-beta-web.ecs.eu-west-1.on.aws
 ```
 
-GitHub human OAuth callback:
+Human GitHub OAuth callback:
 
 ```text
 https://fpllm-beta-web.ecs.eu-west-1.on.aws/auth/github/callback
@@ -175,34 +232,26 @@ GitHub App user-OAuth callback:
 https://fpllm-beta-web.ecs.eu-west-1.on.aws/auth/github-app/callback
 ```
 
-P1 must configure these exact values in the production GitHub OAuth/GitHub App settings and exercise the real flows at P2. Preview, localhost, and staging callback URLs are not production authority.
+P1 configures these exact production callback values; P2 must exercise the real flows. Preview, localhost, fixture, and staging callbacks are not production evidence.
 
-### 4.3 Deploy and rollback
+### 5.2 Deploy and rollback
 
-The web image is built from a frozen source SHA, pushed to private ECR, and deployed by **digest**, not a mutable tag. ECS Express canary deployment and alarm rollback are the default first line of defense.
-
-Manual rollback means updating the service to the previous recorded ECR digest. A rollback does not alter historical learner evidence.
-
-### 4.4 Limits and failure modes
-
-The v0.5 configured application ceiling is two web tasks. AWS account/service quotas must be inspected and retained as P1 provisioning evidence before beta.
+Web images are built from a frozen source SHA, pushed to private ECR, and deployed by digest. ECS Express canary deployment plus alarm rollback is the first line of defense. Manual rollback selects the previous recorded ECR digest. Rollback never rewrites historical learner evidence.
 
 Primary failure modes:
 
-- bad image/configuration -> canary/alarm or manual previous-digest rollback;
-- task/AZ failure -> ECS/Fargate replacement and load balancing;
-- regional AWS outage -> beta unavailable; cross-region active/standby is explicitly out of scope;
-- GitHub outage -> authentication/repository actions fail diagnostically rather than fabricating state.
+- bad image/configuration -> canary/alarm or previous-digest rollback;
+- task/AZ failure -> managed task replacement/load balancing;
+- regional outage -> beta unavailable; cross-region active/standby is out of scope;
+- GitHub outage -> affected identity/repository actions fail diagnostically without fabricated state.
 
 ---
 
-## 5. PostgreSQL
-
-### 5.1 Product and size
+## 6. PostgreSQL
 
 Use **Amazon RDS for PostgreSQL 18.6** in `eu-west-1`.
 
-Initial configuration:
+Frozen initial configuration:
 
 ```text
 engine: PostgreSQL 18.6
@@ -219,47 +268,43 @@ deletion protection: enabled
 final snapshot on destructive teardown: required
 ```
 
-RDS release notes list PostgreSQL 18.6 support as of 2026-08-25. AWS documents `db.t3.small` as 2 vCPU / 2 GiB. The class is intentionally modest for the 3–5 learner beta and is not a scaling claim.
+RDS release notes list PostgreSQL 18.6 support as of 2026-08-25. AWS documents `db.t3.small` as 2 vCPU / 2 GiB. The class is intentionally modest for a 3–5 learner beta and is not a scaling claim.
 
-### 5.2 Single-AZ accepted risk
+### 6.1 Single-AZ accepted risk
 
-Multi-AZ is not required for this beta. The accepted consequence is a larger database outage window during instance/AZ failure. The compensating controls are PITR, restore drills, diagnostic job/evidence state, and a small invited cohort.
+Multi-AZ is not required for the first beta. The accepted consequence is a larger outage window during instance/AZ failure. Compensating controls are PITR, restore drills, durable evidence/job state, and a small invited cohort.
 
-If P1/P5 evidence shows that this availability level prevents credible independent learner completion, resize or move RDS to Multi-AZ through a recorded operational amendment.
+If P1/P5 evidence shows that this availability level prevents credible independent learner completion, resizing or moving to Multi-AZ requires a recorded operations amendment.
 
-### 5.3 Database roles
+### 6.2 Database authority separation
 
-P1 must create separate credentials/roles for:
+P1 creates separate credentials/roles for:
 
-- web application runtime;
+- web runtime;
 - worker runtime;
 - migration/release operation.
 
-The migration role must not be a normal web/worker credential. RDS master credentials are break-glass/provisioning authority and are not supplied to application containers.
+Migration authority is not a normal web/worker credential. RDS master credentials are provisioning/break-glass authority and are not supplied to application containers.
 
 ---
 
-## 6. Learner artifact storage — explicit NO for the first beta
+## 7. Learner artifact storage — explicit NO for first beta
 
-The v0.5 artifact-storage decision is:
+**Do not provision learner-facing S3/object storage for the initial Causal Attention beta.**
 
-> **Do not provision a learner-facing S3/object store for the initial Causal Attention beta.**
+The current loop stores bounded structured result/evidence data, hashes, sizes, and metadata in PostgreSQL. Learner source is materialized ephemerally from an immutable Git commit. The current Causal Attention scientific loop does not require durable binary learner artifacts beyond practical PostgreSQL/request bounds.
 
-The current loop stores bounded structured result/evidence data, hashes, sizes, and metadata in PostgreSQL. Learner source is materialized ephemerally by the worker from an immutable Git commit. The current Causal Attention scientific loop does not require durable binary learner artifacts beyond practical PostgreSQL/request bounds.
+This decision must be reopened before P4 if a required artifact cannot be represented safely within the bounded structured-evidence path.
 
-This decision must be reopened before P4 if a required artifact cannot be represented safely within the existing bounded structured-evidence path.
+If reopened, the implementation must use private S3-compatible storage with signed upload/download, SHA-256 and size verification, private-by-default objects, owner/evidence linkage, and no execution of learner uploads.
 
-If reopened, the required implementation is private Amazon S3 with signed upload/download, SHA-256 and size verification, private-by-default objects, explicit owner/evidence linkage, and no execution of learner uploads.
-
-This decision does **not** prohibit ECR for production container images; ECR is release infrastructure, not learner artifact storage.
+ECR is release infrastructure and is not learner artifact storage.
 
 ---
 
-## 7. Registry and image provenance
+## 8. Registry and image provenance
 
-Use **private Amazon ECR** in `eu-west-1`.
-
-At minimum maintain separately addressable repositories/images for:
+Use **private Amazon ECR** in `eu-west-1` for separately addressable images/repositories at least for:
 
 ```text
 fpllm/web
@@ -268,37 +313,34 @@ fpllm/test-runtime
 fpllm/hidden-evaluator
 ```
 
-Production references use `@sha256:<digest>` identities. Mutable tags such as a source SHA may be attached for human navigation but are never sufficient release identity.
-
-P7 records the exact digests used by web, worker, learner runtime, and hidden evaluator.
+Production identities use `@sha256:<digest>`. Mutable tags may aid navigation but are never sufficient release identity. P7 records exact web/worker/runtime/evaluator digests.
 
 ---
 
-## 8. Worker and sandbox
+## 9. Worker and sandbox
 
-### 8.1 Trusted worker host
+### 9.1 Trusted worker host
 
-Use one On-Demand **Amazon EC2 `m7i.xlarge`** x86_64 instance in `eu-west-1`:
+Use one On-Demand **EC2 `m7i.xlarge`** x86_64 instance:
 
 ```text
+region: eu-west-1
 vCPU: 4
 RAM: 16 GiB
 OS family: Ubuntu 24.04 LTS x86_64
-worker desired hosts: 1
-submission concurrency per host: 1
+ASG min/desired/max: 1/1/1
+submission concurrency: 1
 inbound network: none
 administration: Systems Manager Session Manager
 ```
 
-The production AMI ID is resolved and pinned during P1, then recorded in P7. An Auto Scaling Group/launch template keeps desired host count at one and replaces a failed host.
+The production AMI ID is resolved/pinned during P1 and recorded at P7.
 
-The size is driven by the current execution contract: each submission requests 2 CPU, 4096 MiB, 256 PIDs, and a 180-second sandbox timeout; the hidden phase can have a learner probe and hidden evaluator container alive concurrently. Four vCPU / 16 GiB gives the trusted host explicit runtime headroom without introducing a general compute fleet.
+The size follows the current execution contract: each submission requests 2 CPU, 4096 MiB, 256 PIDs, and a 180-second sandbox timeout; the hidden phase can keep learner-probe and hidden-evaluator containers alive concurrently. Four vCPU / 16 GiB gives the trusted host headroom without creating a general compute fleet.
 
-### 8.2 Isolation primitive
+### 9.2 Sandbox primitive
 
-Production sandboxing uses **Docker Engine with gVisor `runsc`**.
-
-P1 must add/verify `runsc` as the runtime used by learner/public/hidden sandbox containers. The existing restrictions remain mandatory:
+Production sandboxing uses **Docker Engine with gVisor `runsc`**. P1 must add/verify `runsc` for learner/public/hidden containers while preserving:
 
 ```text
 network disabled
@@ -315,96 +357,82 @@ ephemeral workspace
 no Docker socket in learner/evaluator containers
 ```
 
-The existing structural hidden-test rule also remains: private evaluator material is never mounted into the learner sandbox. The learner probe communicates with the hidden evaluator only over the narrow Unix-socket protocol.
+Private evaluator material is structurally absent from the learner sandbox. Learner probe and hidden evaluator communicate only through the frozen narrow Unix-socket protocol.
 
-Docker/gVisor and the EC2 host are part of the trusted computing base. The fact that the trusted worker can control Docker must not be described as if the worker were unprivileged with respect to its host.
+Docker/gVisor and the EC2 host are part of the trusted computing base. The trusted worker's Docker authority must not be described as host-unprivileged.
 
-### 8.3 Hidden evaluator distribution
+### 9.3 Hidden evaluator distribution
 
-For production, the **private evaluator bundle is built into the private hidden-evaluator image** in a trusted release workflow, and that image is pushed to private ECR.
+For production, the **private evaluator bundle is built into the private hidden-evaluator image** in a trusted release workflow and pushed to private ECR.
 
 Consequences:
 
-- the web image/task never receives hidden evaluator code or bundle material;
-- the learner runtime image does not contain hidden tests;
-- the worker references the hidden evaluator by immutable ECR digest;
-- learner sandboxes do not receive ECR credentials or the Docker socket;
-- the production worker no longer needs a plaintext host-mounted private bundle as normal execution state.
+- web image/task never receives hidden evaluator code/material;
+- learner runtime image contains no hidden tests;
+- worker references evaluator by immutable digest;
+- learner sandboxes receive neither ECR credentials nor the Docker socket;
+- normal production execution no longer requires a plaintext host-mounted private bundle.
 
-This requires a P1 worker/runtime refactor because the current v0.4 runtime still accepts `FPLLM_PRIVATE_TEST_BUNDLE_ROOT` as a host mount. P1 must preserve the public commitment/version identity while moving production private material into the evaluator image. Staging may retain its separate materialization harness for release verification if it remains non-production and fail-closed.
+This is a P1 runtime refactor because the v0.4 worker still accepts `FPLLM_PRIVATE_TEST_BUNDLE_ROOT` as a host mount. P1 must preserve the public commitment/version identity while moving production private material into the evaluator image. Non-production staging may retain its separate committed materialization harness if it remains fail-closed.
 
-### 8.4 Host failure/recovery
+### 9.4 Host recovery
 
-The worker is stateless with respect to authoritative learner evidence. PostgreSQL owns durable job/evidence state. A host termination while leasing a job must be recovered by the existing bounded lease/retry semantics and must be exercised at P5.
-
-No failed worker disk is a required backup source.
+Authoritative learner state remains in PostgreSQL, not worker disk. Host termination while leasing a job must recover through bounded lease/retry semantics and must be exercised at P5. No failed worker disk is a required backup source.
 
 ---
 
-## 9. Observability
+## 10. Observability
 
 Use:
 
-- **Amazon CloudWatch Logs** for structured JSON application/worker logs;
-- **CloudWatch Metrics and Alarms** for service/infrastructure health and release alarms;
-- **AWS X-Ray through OpenTelemetry/ADOT** as the trace destination when distributed tracing is instrumented.
+- **CloudWatch Logs** for structured JSON web/worker logs;
+- **CloudWatch Metrics and Alarms** for service/infrastructure/release health;
+- **AWS X-Ray through OpenTelemetry/ADOT** as trace destination where tracing is instrumented.
 
-Initial application log retention: **30 days**.
+Initial application-log retention: **30 days**.
 
 P1 must make correlation identity traversable across:
 
 ```text
-web request
--> submission/job
--> worker lease
--> sandbox execution
--> persisted evidence
+web request -> submission/job -> worker lease -> sandbox execution -> persisted evidence
 ```
 
-The beta operator view must expose at least:
+The operator view must expose web health/latency/5xx, ECS deployment state, RDS availability/connections/storage, EC2/worker readiness, queued job count and oldest job age, submission/test failure class, and runtime/evaluator identities.
 
-- web health, latency, ALB 4xx/5xx;
-- ECS task/deployment state;
-- RDS CPU, connections, free storage and availability;
-- EC2 status checks and worker heartbeat/readiness;
-- queued job count and oldest queued/leased job age;
-- submission/test failure class;
-- runtime/evaluator release identities.
-
-Never send OAuth tokens, session bearer tokens, GitHub App private keys, repository-authorization signing secrets, hidden fixtures, or unnecessary learner-private text to logs/traces.
+Never send OAuth/session tokens, GitHub App private keys, repository-authorization signing secrets, hidden fixtures, or unnecessary learner-private text to telemetry.
 
 ---
 
-## 10. Secrets and IAM
+## 11. Secrets and IAM
 
-Use **AWS Secrets Manager with KMS encryption** for production application secrets.
+Use **AWS Secrets Manager with KMS encryption**.
 
 Runtime AWS authentication uses IAM roles:
 
-- ECS task execution role for ECR/log bootstrap needs;
-- ECS web task role for only the AWS APIs the web process actually needs;
-- EC2 worker instance profile for only ECR pull, required secret reads, CloudWatch/SSM, and related worker operations;
+- ECS task execution role for ECR/log bootstrap;
+- ECS web task role for only required web APIs;
+- EC2 worker instance profile for required ECR/secret/CloudWatch/SSM operations;
 - GitHub Actions deployment role assumed through GitHub OIDC;
 - separate migration task role.
 
-No static AWS access key is stored in application configuration or GitHub Actions.
+No static AWS access key is stored in application config or GitHub Actions.
 
-Secret groups are separated by consumer. Web-only authority is not supplied to the worker, and worker-only authority is not supplied to the web.
+Web-only authority is not supplied to the worker and worker-only authority is not supplied to web.
 
 Rotation baseline:
 
-- application/database credentials: rotate at least every 90 days and immediately on suspected compromise; automate through Secrets Manager where the selected credential type supports a tested rotation path;
-- GitHub OAuth client secret / GitHub App private key: controlled manual rotation at least every 90 days and immediately on suspected compromise, with new material installed before old material is revoked where the provider permits overlap;
-- repository-authorization/session signing secrets: rotate at least every 90 days or on compromise using a documented overlap/invalidation procedure;
-- after any rotation, restart/redeploy affected workloads so environment-injected secret values cannot remain indefinitely cached.
+- application/database credentials: at least every 90 days and immediately on suspected compromise, automated where a tested Secrets Manager rotation path exists;
+- GitHub OAuth secret / GitHub App private key: controlled rotation at least every 90 days and on compromise, overlapping old/new material where provider behavior permits;
+- repository-authorization/session signing secrets: at least every 90 days or on compromise with documented overlap/invalidation semantics;
+- redeploy/restart affected workloads after rotation when secrets are environment-injected.
 
-P1 must write and exercise the rotation runbook before external beta. A schedule alone is not rotation evidence.
+P1 writes and exercises the rotation runbook before external beta. A schedule alone is not rotation evidence.
 
 ---
 
-## 11. DNS and TLS
+## 12. DNS and TLS
 
-The initial beta intentionally uses the AWS-managed ECS Express application domain:
+Initial beta uses:
 
 ```text
 fpllm-beta-web.ecs.eu-west-1.on.aws
@@ -413,64 +441,54 @@ fpllm-beta-web.ecs.eu-west-1.on.aws
 Therefore:
 
 - no customer-owned DNS zone is required for v0.5;
-- AWS owns the `on.aws` DNS namespace;
-- ECS Express provisions/manages the HTTPS certificate lifecycle through its managed infrastructure;
-- HTTP is not a canonical production origin;
-- adding a custom domain is deferred until after the beta because changing origin affects OAuth callbacks, cookies, runbooks, and release evidence.
+- AWS owns the `on.aws` namespace;
+- ECS Express manages HTTPS certificate lifecycle for its managed application endpoint;
+- HTTP is not the canonical production origin;
+- adding a custom domain is deferred because changing origin affects callbacks, cookies, runbooks, and release evidence.
 
-A future custom domain is a deliberate production-origin migration, not an in-place cosmetic change.
+A future custom domain requires a deliberate production-origin amendment/migration.
 
 ---
 
-## 12. Backup, restore, RPO and RTO
+## 13. Backup, restore, RPO and RTO
 
-### 12.1 Policy
+RDS automated backups/PITR use **7-day retention**. Before a material production migration, create and record a manual RDS snapshot.
 
-RDS automated backups and point-in-time recovery remain enabled with **7-day retention**. RDS documentation states that transaction logs are uploaded every five minutes for PITR.
-
-Before a production migration with material schema/data risk, create and record a manual RDS snapshot.
-
-Operational targets for this beta:
+Project targets:
 
 ```text
 RPO target: <= 15 minutes
 RTO target: <= 2 hours
 ```
 
-These are project targets, not AWS SLAs. P1 must measure them with an actual restore drill before external beta.
+These are project targets, not AWS SLAs. P1 must measure them in a real restore drill. AWS documentation states that RDS transaction logs are uploaded every five minutes for PITR, but the stricter project RPO is still verified empirically.
 
-### 12.2 Restore procedure
-
-A database recovery restores a snapshot/PITR point to a **new RDS instance** rather than overwriting the failed source.
-
-Required drill sequence:
+Restore procedure:
 
 1. select recorded snapshot/PITR time;
-2. restore into a clean non-production RDS target with production-equivalent engine/settings;
-3. apply required VPC/security groups/parameter settings;
-4. verify migration state plus learner/evidence referential relationships;
-5. run controlled application smoke checks against the restored database;
-6. measure data loss window and recovery elapsed time against RPO/RTO targets;
-7. retain restore identities/logs in the v0.5 release record;
-8. only for a real incident, rotate/update the database endpoint secret and redeploy web/worker after the restored target is accepted.
+2. restore into a **new** non-production RDS instance with production-equivalent engine/settings;
+3. apply required VPC/security/parameter settings;
+4. verify migration state and learner/evidence referential relationships;
+5. run controlled smoke checks against restored data;
+6. measure data-loss window and elapsed recovery time;
+7. retain restore resource identities/logs;
+8. for a real incident only, update/rotate the database endpoint secret and redeploy web/worker after accepting the restored target.
 
-Recovery never rewrites historical failed learner evidence merely to create a passing state.
+Recovery never rewrites historical failed learner evidence merely to create a passing result.
 
 ---
 
-## 13. Release, migration, promotion and rollback
+## 14. Release, migration, promotion and rollback
 
-### 13.1 Infrastructure as code
+### 14.1 Infrastructure as code
 
-P1 production infrastructure is defined with **AWS CDK v2 in TypeScript** inside the repository. Console-only resource creation is not the production source of truth except for bootstrap/account operations that CDK cannot reasonably own; any such operation must be recorded in the runbook.
+Use **AWS CDK v2 in TypeScript** inside the repository. Console-only production resource creation is not source of truth except account/bootstrap operations CDK cannot reasonably own; exceptions must be recorded in runbooks.
 
-### 13.2 Deployment identity
+### 14.2 Deployment identity
 
-GitHub Actions assumes an AWS deployment role through **GitHub OIDC**. The workflow builds source-SHA-attributable images, pushes to private ECR, records their digests, and promotes exact digests.
+GitHub Actions assumes an AWS deployment role via **GitHub OIDC**. Workflows build source-SHA-attributable images, push to private ECR, record digests, and promote exact digests.
 
-### 13.3 Promotion sequence
-
-Production promotion order:
+### 14.3 Promotion order
 
 ```text
 CI + review clean
@@ -478,134 +496,137 @@ CI + review clean
 -> build/publish immutable images
 -> record ECR digests
 -> pre-migration RDS snapshot when required
--> run version-controlled expand-compatible Prisma migration
+-> version-controlled expand-compatible Prisma migration
 -> verify migration
--> deploy web digest through ECS Express canary
--> run production smoke gate
--> deploy/update worker digest + runtime/evaluator digests
--> run queue/worker smoke gate
--> record release identities and evidence
+-> ECS Express canary web deploy
+-> production smoke gate
+-> worker/runtime/evaluator digest update
+-> queue/worker smoke gate
+-> record release identities/evidence
 ```
 
-Migrations run as a one-off ECS/Fargate migration task in the VPC using the separate migration role. Manual SQL absent from version control is prohibited.
+Migrations run as a one-off Fargate task in the VPC using the separate migration role. Manual SQL absent from version control is prohibited.
 
-### 13.4 Smoke gate
+### 14.4 Smoke gate
 
-Before a release is accepted, verify at minimum:
+At minimum verify:
 
 - canonical HTTPS origin and health endpoint;
-- production `NODE_ENV=production` and fixture authority impossible;
-- database connectivity and expected migration identity;
-- real deployment image digests equal the candidate record;
-- queue can accept/lease a controlled diagnostic job without fixture-derived learner authority;
+- `NODE_ENV=production` and production fixture authority impossible;
+- DB connectivity and expected migration identity;
+- deployed image digests equal candidate record;
+- queue accepts/leases a controlled diagnostic job without fixture-derived learner authority;
 - worker host/runtime preflight passes, including gVisor and digest identities;
 - no production secret/hidden fixture appears in logs.
 
-P2/P3 real learner/repository/submission evidence remains separate and cannot be replaced by this infrastructure smoke test.
+P2/P3 real learner/repository/submission evidence remains separate and cannot be replaced by infrastructure smoke tests.
 
-### 13.5 Rollback
+### 14.5 Rollback
 
-Application rollback is previous-digest promotion:
+- web: ECS Express alarm rollback or previous ECR digest;
+- worker: previous worker/runtime/evaluator digests and worker launch configuration;
+- database: forward-compatible migrations preferred; no destructive evidence down-migration. If recovery is necessary, restore snapshot/PITR to a new instance.
 
-- web: ECS Express automatic alarm rollback or manual previous ECR digest;
-- worker: restore previous worker/runtime/evaluator digests and worker launch configuration;
-- database: prefer forward-compatible migrations; do not destructively down-migrate evidence. If database recovery is necessary, restore snapshot/PITR to a new instance and follow the restore procedure.
-
-Release PRs must follow the post-PR-#9 process rule: inspect and disposition all human/automated review findings, rerun affected gates, and only then resolve review threads and merge.
+Release PRs follow the post-PR-#9 process rule: inspect/disposition all automated/human findings, rerun affected gates, then resolve review threads and merge.
 
 ---
 
-## 14. Cost envelope and budget controls
+## 15. Cost envelope and budget controls
 
-For P0 planning, the minimum viable always-on 3–5 learner beta is budgeted at **USD 250–400 per 30-day month**, excluding taxes, unusual data transfer, runaway logs/traces, and learner-owned GPU compute.
+P0 planning envelope for an always-on 3–5 learner beta: **USD 250–400 per 30-day month**, excluding taxes, unusual transfer, runaway telemetry, and learner-owned GPU compute.
 
-Expected cost drivers, in descending order, are the always-on EC2 worker, Fargate/ALB web service, RDS, then EBS/ECR/Secrets Manager/CloudWatch usage.
+Expected main drivers are the EC2 worker, Fargate/ALB web path, RDS, then EBS/ECR/Secrets Manager/CloudWatch.
 
-This number is a planning envelope, **not an AWS quote and not measured spend**. Before P1 creates production resources it must produce and retain a region-specific AWS Pricing Calculator estimate using the exact selected sizes. After provisioning, Cost Explorer/billing data becomes the authoritative spend evidence.
+This is a planning envelope, **not an AWS quote or measured spend**. Before P1 creates resources, retain a region-specific AWS Pricing Calculator estimate using the frozen sizes. After provisioning, AWS billing/Cost Explorer is the authoritative spend evidence.
 
 Budget controls:
 
 ```text
-initial monthly budget alert: USD 450
+monthly budget alert: USD 450
 mandatory cost review threshold: USD 600
 ```
 
-The review threshold is not an automatic resource kill switch; production must not terminate active learner evidence processing merely to satisfy a budget alarm.
-
-The worker may be scaled to zero only during an explicitly announced beta pause. Independent learner validation otherwise requires the worker to remain available without operator intervention.
+The review threshold is not an automatic resource kill switch. Active learner evidence processing is not terminated solely to satisfy a budget alarm. Worker scale-to-zero is allowed only during an explicitly announced beta pause.
 
 ---
 
-## 15. Provider failure model and exit path
+## 16. Provider failure model and exit path
 
-| Failure | Expected behavior / recovery |
+| Failure | Expected response |
 |---|---|
 | ECS bad release | canary/alarm rollback or previous digest |
 | ECS task/AZ failure | managed task replacement/load balancing |
-| RDS instance/AZ failure | service outage accepted for beta; restore/PITR if necessary |
+| RDS instance/AZ failure | beta outage accepted; restore/PITR if necessary |
 | EC2 worker loss | ASG replaces host; durable lease/retry returns work to diagnosable state |
-| ECR unavailable | no new image pull/deploy; currently running workloads continue where possible |
-| Secrets Manager unavailable | no new secret retrieval/redeploy; never fall back to embedded secrets |
-| CloudWatch/X-Ray impaired | application continues only if core evidence path remains healthy; emit/reconcile telemetry when restored, without inventing learner events |
-| GitHub unavailable | auth/repo/source actions fail diagnostically; no synthetic authority |
-| `eu-west-1` regional outage | beta unavailable; cross-region DR deferred |
+| ECR unavailable | no new image pull/deploy; running workloads continue where possible |
+| Secrets Manager unavailable | no fallback to embedded secrets |
+| CloudWatch/X-Ray impaired | core evidence path may continue if healthy; never invent telemetry/learner events |
+| GitHub unavailable | auth/repository/source actions fail diagnostically; no synthetic authority |
+| `eu-west-1` outage | beta unavailable; cross-region DR deferred |
 
-Exit/migration properties are intentionally preserved:
+Exit properties are preserved:
 
-- web/worker are OCI containers;
-- durable state is PostgreSQL 18;
+- web/worker remain OCI containers;
+- durable state remains PostgreSQL 18;
 - learner object storage is absent initially and, if later added, remains behind an S3-compatible contract;
 - source authority remains GitHub App based;
-- AWS-specific CDK/IAM/network definitions are isolated infrastructure code rather than application-domain state.
+- AWS-specific CDK/IAM/network definitions remain infrastructure code rather than learner-domain state.
 
-Moving from AWS therefore requires infrastructure replacement and data migration, not a rewrite of learner evidence semantics.
-
----
-
-## 16. P1 implementation checklist created by this decision
-
-P1 must now implement and verify, without changing P0 silently:
-
-1. AWS account/region bootstrap, GitHub OIDC deployment role, CDK bootstrap and cost budget;
-2. production VPC/subnets/security groups with no worker inbound path and private RDS;
-3. private ECR repositories and digest-only production promotion;
-4. RDS PostgreSQL 18.6, roles, migrations, 7-day PITR and deletion safeguards;
-5. ECS Express web service, canonical origin, `/api/healthz`, fail-closed production fixture behavior and CloudWatch alarms;
-6. EC2 worker launch template/ASG, SSM-only administration, Docker + gVisor preflight, one-job concurrency;
-7. production hidden-evaluator image build that embeds the private evaluator bundle and removes the normal host-mounted private-bundle dependency;
-8. Secrets Manager/IAM least privilege plus documented rotation path;
-9. structured logs, metrics, correlation/trace plumbing and minimum operator dashboard;
-10. release/migration/smoke/rollback automation;
-11. clean-environment provisioning test plus backup/restore and rollback drills;
-12. retained P1 evidence including quotas, Pricing Calculator estimate, resource identities, image digests, migration identity, restore timings and rollback result.
-
-P1 is not complete until those actions are exercised against the selected production environment. A merged CDK stack alone is not P1 evidence.
+Moving from AWS therefore requires infrastructure replacement/data migration, not a rewrite of learner evidence semantics.
 
 ---
 
-## 17. Official research basis at decision freeze
+## 17. P1 implementation checklist created by P0
 
-Provider/service claims in this P0 record were checked against official sources on 2026-09-20:
+P1 must implement and verify, without silently changing P0:
 
-- Amazon ECS Express Mode overview: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/express-service-overview.html
-- ECS Express first service / `servicename.ecs.region.on.aws` URL: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/express-service-getting-started.html
-- ECS Express API, custom service name/network/health/resource settings: https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_CreateExpressGatewayService.html
+1. no-create quota/availability admission report proving all minimums in §3;
+2. AWS account/region bootstrap, GitHub OIDC deployment role, CDK bootstrap and cost budget;
+3. VPC/subnets/security groups with no worker inbound path and private RDS;
+4. private ECR repositories and digest-only production promotion;
+5. RDS PostgreSQL 18.6, separate roles, migrations, PITR and deletion safeguards;
+6. ECS Express web service, canonical origin, `/api/healthz`, fail-closed fixture behavior and alarms;
+7. EC2 ASG 1/1/1, SSM-only administration, Docker + gVisor preflight, one-job concurrency;
+8. hidden-evaluator image build that embeds private evaluator material and removes the normal production host-mounted private-bundle dependency;
+9. Secrets Manager/IAM least privilege plus exercised rotation runbook;
+10. structured logs/metrics/correlation/trace plumbing and minimum operator dashboard;
+11. release/migration/smoke/rollback automation;
+12. clean-environment provisioning test, backup/restore drill and rollback drill;
+13. retained P1 evidence: quotas, Pricing Calculator estimate, resource IDs, image digests, migration ID, restore timings and rollback result.
+
+P1 is not complete until those operations are exercised against the selected production environment. A merged CDK stack alone is not P1 evidence.
+
+---
+
+## 18. Official research basis at decision freeze
+
+Provider/service claims were checked against official sources on 2026-09-20:
+
+- ECS Express overview: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/express-service-overview.html
+- ECS Express first service / `servicename.ecs.region.on.aws`: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/express-service-getting-started.html
+- ECS Express create API / network, health, resource settings: https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_CreateExpressGatewayService.html
 - ECS Express resources/network defaults: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/express-service-work.html
 - ECS Express canary/alarm rollback: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/express-service-update-full.html
-- AWS App Runner availability change: https://docs.aws.amazon.com/apprunner/latest/dg/apprunner-availability-change.html
+- App Runner availability change: https://docs.aws.amazon.com/apprunner/latest/dg/apprunner-availability-change.html
+- ECS endpoints and quotas, including Fargate defaults/rates and ECS hard limits: https://docs.aws.amazon.com/general/latest/gr/ecs-service.html
+- ECS quota management / default versus applied quota inspection: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-quotas-manage.html
 - RDS PostgreSQL release history (18.6): https://docs.aws.amazon.com/AmazonRDS/latest/PostgreSQLReleaseNotes/doc-history.html
 - RDS DB class hardware: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.DBInstanceClass.Summary.html
+- RDS quotas: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_Limits.html
 - RDS automated backups/retention: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithAutomatedBackups.html
 - RDS point-in-time restore: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_PIT.html
 - EC2 M7i hardware: https://aws.amazon.com/ec2/instance-types/general-purpose/
 - EC2 instance families by region: https://docs.aws.amazon.com/ec2/latest/instancetypes/ec2-instance-regions.html
+- EC2 On-Demand instance quotas: https://docs.aws.amazon.com/ec2/latest/instancetypes/ec2-instance-quotas.html
+- ALB quotas: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-limits.html
+- VPC quotas: https://docs.aws.amazon.com/vpc/latest/userguide/amazon-vpc-limits.html
 - gVisor Docker runtime quick start: https://gvisor.dev/docs/user_guide/quick_start/docker/
 - gVisor installation: https://gvisor.dev/docs/user_guide/install/
 - Secrets Manager rotation schedules: https://docs.aws.amazon.com/secretsmanager/latest/userguide/rotate-secrets_schedule.html
-- Amazon Fargate pricing: https://aws.amazon.com/fargate/pricing/
-- Amazon RDS for PostgreSQL pricing: https://aws.amazon.com/rds/postgresql/pricing/
-- Amazon EC2 On-Demand pricing: https://aws.amazon.com/ec2/pricing/on-demand/
-- Amazon ECR pricing: https://aws.amazon.com/ecr/pricing/
-- Amazon CloudWatch pricing: https://aws.amazon.com/cloudwatch/pricing/
+- Fargate pricing: https://aws.amazon.com/fargate/pricing/
+- RDS PostgreSQL pricing: https://aws.amazon.com/rds/postgresql/pricing/
+- EC2 On-Demand pricing: https://aws.amazon.com/ec2/pricing/on-demand/
+- ECR pricing: https://aws.amazon.com/ecr/pricing/
+- CloudWatch pricing: https://aws.amazon.com/cloudwatch/pricing/
 
-Service availability, quotas and prices can change. P1 must re-check the selected region immediately before provisioning and record the observed values; that re-check does not reopen the architectural decision unless a required product/feature is no longer available.
+Service availability, applied account quotas, and prices can change. P1 must re-check the selected account/region immediately before provisioning and retain the observed values. That check does not authorize architecture substitution; a requirement that cannot be met reopens P0 by amendment.
