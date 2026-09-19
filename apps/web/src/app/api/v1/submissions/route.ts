@@ -1,10 +1,11 @@
 import { submissionCreateSchema } from "@fpllm/api-contracts";
 import {
-  createVerifiedSubmissionAndQueueForDemo,
-  getBoundRepositoryIdentityForDemo,
+  createVerifiedSubmissionAndQueueForUser,
+  getBoundRepositoryIdentityForUser,
 } from "@fpllm/db";
 import { GitHubAppClient } from "@fpllm/github";
 import { NextResponse } from "next/server";
+import { getCurrentLearner } from "@/lib/auth";
 
 function githubClient() {
   const appId = process.env.GITHUB_APP_ID;
@@ -14,6 +15,8 @@ function githubClient() {
 }
 
 export async function POST(request: Request) {
+  const current = await getCurrentLearner();
+  if (!current) return NextResponse.json({ ok: false, code: "AUTHENTICATION_REQUIRED" }, { status: 401 });
   const parsed = submissionCreateSchema.safeParse(await request.json());
   if (!parsed.success) {
     return NextResponse.json(
@@ -24,7 +27,7 @@ export async function POST(request: Request) {
 
   try {
     const requestedCommit = parsed.data.commit.toLowerCase();
-    const repository = await getBoundRepositoryIdentityForDemo(parsed.data.repositoryId);
+    const repository = await getBoundRepositoryIdentityForUser(current.user.id, parsed.data.repositoryId);
     const resolved = await githubClient().resolveRepository({
       installationId: repository.installationId,
       owner: repository.owner,
@@ -42,7 +45,7 @@ export async function POST(request: Request) {
       throw new Error("REPOSITORY_IDENTITY_MISMATCH");
     }
 
-    const queued = await createVerifiedSubmissionAndQueueForDemo({
+    const queued = await createVerifiedSubmissionAndQueueForUser(current.user.id, {
       repositoryId: repository.repositoryDbId,
       branch: parsed.data.branch,
       commitSha: resolved.commitSha.toLowerCase(),
@@ -60,7 +63,7 @@ export async function POST(request: Request) {
     );
   } catch (error) {
     const code = error instanceof Error ? error.message : "SUBMISSION_CREATE_FAILED";
-    const status = code === "GITHUB_APP_NOT_CONFIGURED" ? 503 : 409;
+    const status = code === "GITHUB_APP_NOT_CONFIGURED" ? 503 : code === "REPOSITORY_NOT_FOUND" ? 404 : 409;
     return NextResponse.json({ ok: false, code }, { status });
   }
 }

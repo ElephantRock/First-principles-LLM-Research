@@ -31,6 +31,7 @@ jobs:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/fpllm?schema=public
       COURSE_CONTENT_ROOT: ./course
       FPLLM_DEMO_HANDLE: demo
+      FPLLM_DEMO_AUTH: "1"
       FPLLM_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
 
     steps:
@@ -128,4 +129,6 @@ jobs:
         run: pnpm --filter @fpllm/web exec playwright install --with-deps chromium webkit
 
       - name: End-to-end vertical slice
+        env:
+          FPLLM_E2E_AUTH: "1"
         run: pnpm --filter @fpllm/web test:e2e

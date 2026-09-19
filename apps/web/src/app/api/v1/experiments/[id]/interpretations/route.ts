@@ -1,8 +1,11 @@
 import { interpretationCreateSchema } from "@fpllm/api-contracts";
-import { finalizeInterpretationForDemo } from "@fpllm/db";
+import { finalizeInterpretationForUser } from "@fpllm/db";
 import { NextResponse } from "next/server";
+import { getCurrentLearner } from "@/lib/auth";
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
+  const current = await getCurrentLearner();
+  if (!current) return NextResponse.json({ ok: false, code: "AUTHENTICATION_REQUIRED" }, { status: 401 });
   const { id } = await context.params;
   const parsed = interpretationCreateSchema.safeParse(await request.json());
   if (!parsed.success) {
@@ -13,7 +16,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
   }
 
   try {
-    const result = await finalizeInterpretationForDemo({
+    const result = await finalizeInterpretationForUser(current.user.id, {
       experimentId: id,
       observation: parsed.data.observation,
       interpretation: parsed.data.interpretation,
