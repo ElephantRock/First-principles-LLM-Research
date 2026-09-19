@@ -68,7 +68,7 @@ jobs:
       - name: Validate course content
         run: pnpm content:validate
 
-      - name: Validate probe protocol runtime
+      - name: Validate probe protocol and staging runtime support
         run: |
           python -m py_compile \
             infra/docker/test-runtime/probe/protocol.py \
@@ -77,11 +77,32 @@ jobs:
             test-bundles/public/phase1-causal-attention@1.0/runner.py \
             scripts/ci/probe_memory_trace_client.py \
             scripts/ci/inspect_sandbox_topology.py \
-            scripts/release/runtime_image_provenance.py
+            scripts/release/runtime_image_provenance.py \
+            scripts/staging/materialize_private_bundle.py
           python -m unittest discover \
             -s infra/docker/test-runtime/tests \
             -p 'test_*.py' \
             -v
+          python - <<'PY'
+          import json, re
+          from pathlib import Path
+
+          path = Path('hidden-tests/phase1/causal-attention/private-bundle-commitment.json')
+          doc = json.loads(path.read_text(encoding='utf-8'))
+          assert doc['schemaVersion'] == '1'
+          assert doc['testBundleId'] == 'phase1-causal-attention@1.0'
+          assert doc['privateEvaluatorVersion'] == '1.0.0'
+          assert doc['archiveFormat'] == 'tar.gz'
+          assert re.fullmatch(r'[0-9a-f]{64}', doc['archiveSha256'])
+          assert isinstance(doc['archiveBytes'], int) and 0 < doc['archiveBytes'] <= 48 * 1024
+          assert doc['adapterInterface'] == 'causal-attention-v1'
+          assert doc['memoryTraceSchema'] == '2'
+          assert doc['hiddenInvariants'] == [
+              'attention.randomized_numerics',
+              'attention.no_permanent_kv_repeat',
+          ]
+          print('private evaluator public commitment: VALID')
+          PY
 
       - name: Validate executable Causal Attention runtime images
         run: bash scripts/ci/validate_causal_attention_runtime.sh
