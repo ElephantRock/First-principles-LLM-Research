@@ -132,7 +132,7 @@ def image_identity(binary: str, image: str, *, allow_local: bool) -> dict[str, A
         "repoDigests": document.get("RepoDigests") or [],
         "architecture": document.get("Architecture"),
         "os": document.get("Os"),
-        "fpllmRole": labels.get("org.fpllm.runtime.role"),
+        "fpllmRole": labels.get("io.fpllm.runtime-role"),
         "sourceRevision": labels.get("org.opencontainers.image.revision"),
     }
 
