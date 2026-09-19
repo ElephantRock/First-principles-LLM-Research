@@ -153,9 +153,51 @@ jobs:
       - name: Execute real GitHub App worker path
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           test -x packages/db/node_modules/.bin/tsx
           packages/db/node_modules/.bin/tsx apps/worker/src/staging.ts
+          rc=$?
+          if [[ $rc -ne 0 ]]; then
+            echo "staging harness failed; dumping durable submission-test state" >&2
+            packages/db/node_modules/.bin/tsx -e '
+              import { prisma } from "./packages/db/src/index.ts";
+              const jobs = await prisma.job.findMany({
+                where: { jobType: "submission_test" },
+                orderBy: { createdAt: "asc" },
+                select: {
+                  id: true,
+                  testRunId: true,
+                  state: true,
+                  attemptCount: true,
+                  leaseOwner: true,
+                  nextAttemptAt: true,
+                  createdAt: true,
+                  completedAt: true,
+                  events: {
+                    orderBy: { createdAt: "asc" },
+                    select: { eventType: true, dataJson: true, createdAt: true },
+                  },
+                },
+              });
+              const runs = await prisma.testRun.findMany({
+                orderBy: { startedAt: "asc" },
+                select: {
+                  id: true,
+                  submissionId: true,
+                  state: true,
+                  startedAt: true,
+                  completedAt: true,
+                  results: {
+                    orderBy: { invariantId: "asc" },
+                    select: { visibility: true, invariantId: true, passed: true },
+                  },
+                },
+              });
+              console.log(JSON.stringify({ jobs, runs }, null, 2));
+              await prisma.$disconnect();
+            '
+            exit "$rc"
+          fi
 
       - name: Bind both staging artifacts to frozen candidate
         shell: bash
