@@ -1,0 +1,142 @@
+name: v0.3 Runtime Publish Frozen Candidate
+
+on:
+  push:
+    branches:
+      - release/v0.3-runtime-publish-f009cbc7
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-runtime-images:
+    runs-on: ubuntu-24.04
+    env:
+      CANDIDATE_SHA: f009cbc7f70726cda92e0750b5836ecc7953b7a7
+      LEARNER_LOCAL_IMAGE: fpllm/test-runtime:ci
+      EVALUATOR_LOCAL_IMAGE: fpllm/hidden-evaluator:ci
+      REGISTRY_NAMESPACE: ${{ github.repository_owner }}
+
+    steps:
+      - name: Checkout frozen candidate
+        uses: actions/checkout@v4
+        with:
+          ref: f009cbc7f70726cda92e0750b5836ecc7953b7a7
+          fetch-depth: 1
+
+      - name: Verify frozen candidate identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$CANDIDATE_SHA"
+          echo "FPLLM_SOURCE_COMMIT=$actual" >> "$GITHUB_ENV"
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate candidate runtime images and evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f scripts/ci/validate_causal_attention_runtime.sh
+          test -f scripts/release/runtime_image_provenance.py
+          test -f hidden-tests/phase1/causal-attention/private-bundle-commitment.json
+          bash scripts/ci/validate_causal_attention_runtime.sh
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish and resolve immutable registry identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          namespace="${REGISTRY_NAMESPACE,,}"
+          learner_repo="ghcr.io/${namespace}/fpllm-test-runtime"
+          evaluator_repo="ghcr.io/${namespace}/fpllm-hidden-evaluator"
+          short_sha="${CANDIDATE_SHA:0:12}"
+          learner_tag="${learner_repo}:rc-${short_sha}"
+          evaluator_tag="${evaluator_repo}:rc-${short_sha}"
+
+          docker tag "$LEARNER_LOCAL_IMAGE" "$learner_tag"
+          docker tag "$EVALUATOR_LOCAL_IMAGE" "$evaluator_tag"
+          docker push "$learner_tag"
+          docker push "$evaluator_tag"
+
+          docker pull "$learner_tag" >/dev/null
+          docker pull "$evaluator_tag" >/dev/null
+          learner_ref="$(docker image inspect "$learner_tag" --format '{{index .RepoDigests 0}}')"
+          evaluator_ref="$(docker image inspect "$evaluator_tag" --format '{{index .RepoDigests 0}}')"
+          learner_digest="${learner_ref##*@}"
+          evaluator_digest="${evaluator_ref##*@}"
+
+          [[ "$learner_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$evaluator_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          python scripts/release/runtime_image_provenance.py \
+            --image "$learner_tag" \
+            --role learner-runtime \
+            --dockerfile infra/docker/test-runtime/Dockerfile \
+            --input infra/docker/test-runtime/probe \
+            --source-commit "$CANDIDATE_SHA" \
+            --registry-digest "$learner_digest" \
+            --output .artifacts/runtime-release/learner-runtime.published.provenance.json
+
+          python scripts/release/runtime_image_provenance.py \
+            --image "$evaluator_tag" \
+            --role hidden-evaluator \
+            --dockerfile infra/docker/hidden-evaluator/Dockerfile \
+            --source-commit "$CANDIDATE_SHA" \
+            --registry-digest "$evaluator_digest" \
+            --output .artifacts/runtime-release/hidden-evaluator.published.provenance.json
+
+          LEARNER_REPO="$learner_repo" EVALUATOR_REPO="$evaluator_repo" \
+          LEARNER_DIGEST="$learner_digest" EVALUATOR_DIGEST="$evaluator_digest" \
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          root = Path('.artifacts/runtime-release')
+          commitment = json.loads(Path('hidden-tests/phase1/causal-attention/private-bundle-commitment.json').read_text())
+          release = {
+              'schemaVersion': '1',
+              'kind': 'fpllm-runtime-image-release-candidate',
+              'trigger': 'explicit-chat-authorized-one-shot',
+              'sourceCommit': os.environ['CANDIDATE_SHA'],
+              'learnerRuntime': {
+                  'repository': os.environ['LEARNER_REPO'],
+                  'digest': os.environ['LEARNER_DIGEST'],
+                  'reference': os.environ['LEARNER_REPO'] + '@' + os.environ['LEARNER_DIGEST'],
+              },
+              'hiddenEvaluator': {
+                  'repository': os.environ['EVALUATOR_REPO'],
+                  'digest': os.environ['EVALUATOR_DIGEST'],
+                  'reference': os.environ['EVALUATOR_REPO'] + '@' + os.environ['EVALUATOR_DIGEST'],
+              },
+              'testBundleId': 'phase1-causal-attention@1.0',
+              'adapterInterface': 'causal-attention-v1',
+              'memoryTraceSchema': '2',
+              'privateEvaluatorCommitment': {
+                  'version': commitment['privateEvaluatorVersion'],
+                  'archiveSha256': commitment['archiveSha256'],
+                  'archiveBytes': commitment['archiveBytes'],
+              },
+          }
+          (root / 'published-release-candidate.json').write_text(json.dumps(release, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(release, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload publication evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: v03-runtime-release-f009cbc7-${{ github.run_id }}
+          path: .artifacts/runtime-release/
+          if-no-files-found: error
+          retention-days: 30
