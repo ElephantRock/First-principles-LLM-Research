@@ -247,7 +247,7 @@ export async function getExperimentByDisplayIdForUser(userId: string, displayId:
     include: {
       runs: { orderBy: { createdAt: "desc" }, include: { metrics: true } },
       artifacts: true,
-      journalEntry: { include: { versions: { orderBy: { version: "desc" } } },
+      journalEntry: { include: { versions: { orderBy: { version: "desc" } } } },
       submission: true,
     },
   });
