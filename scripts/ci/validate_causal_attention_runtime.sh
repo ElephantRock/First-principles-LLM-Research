@@ -203,4 +203,19 @@ python "$ROOT/scripts/ci/inspect_sandbox_topology.py" \
 
 docker rm -f fpllm-ci-topology-learner fpllm-ci-topology-evaluator >/dev/null
 
-echo "causal-attention runtime image + fixture + topology validation: PASS"
+# Exercise the deployment preflight against the actual CI Docker host and locally built images.
+# Production runs omit --allow-local-image and therefore require digest-addressed images.
+HOST_WORKER_TEMP="$TMP/worker-host-temp"
+HOST_PRIVATE="$TMP/worker-host-private"
+mkdir -p "$HOST_WORKER_TEMP" "$HOST_PRIVATE"
+printf '%s\n' '# CI private-root placeholder; no hidden evaluator source is stored here.' > "$HOST_PRIVATE/README.txt"
+python "$ROOT/scripts/ops/verify_worker_host.py" \
+  --learner-image "$IMAGE" \
+  --evaluator-image "$EVALUATOR_IMAGE" \
+  --worker-temp-root "$HOST_WORKER_TEMP" \
+  --public-bundle-root "$ROOT/test-bundles/public" \
+  --private-bundle-root "$HOST_PRIVATE" \
+  --output "$ARTIFACT_DIR/worker-host-preflight.json" \
+  --allow-local-image
+
+echo "causal-attention runtime image + fixture + topology + host preflight validation: PASS"
