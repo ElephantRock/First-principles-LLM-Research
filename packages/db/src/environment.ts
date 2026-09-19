@@ -270,20 +270,22 @@ export async function getLatestEnvironmentQualificationForUser(userId: string) {
   });
   if (!environmentReport) return null;
 
+  const cudaAvailable = readCudaMarker(environmentReport.reportJson);
+  const selectedProfile = environmentReport.selectedProfile as HardwareProfile | null;
   const input: EnvironmentReportInput = {
-    pythonVersion: environmentReport.pythonVersion ?? undefined,
-    pytorchVersion: environmentReport.pytorchVersion ?? undefined,
-    operatingSystem: environmentReport.operatingSystem ?? undefined,
-    cudaVersion: environmentReport.cudaVersion ?? undefined,
-    cudaAvailable: readCudaMarker(environmentReport.reportJson),
-    gpuModel: environmentReport.gpuModel ?? undefined,
-    totalVramBytes: environmentReport.totalVramBytes == null ? undefined : Number(environmentReport.totalVramBytes),
-    bf16Supported: environmentReport.bf16Supported ?? undefined,
-    selectedProfile: (environmentReport.selectedProfile as HardwareProfile | null) ?? undefined,
-    fpllmVersion: environmentReport.fpllmVersion ?? undefined,
-    repositoryCommit: environmentReport.repositoryCommit ?? undefined,
     capturedAt: environmentReport.capturedAt.toISOString(),
     report: {},
+    ...(environmentReport.pythonVersion == null ? {} : { pythonVersion: environmentReport.pythonVersion }),
+    ...(environmentReport.pytorchVersion == null ? {} : { pytorchVersion: environmentReport.pytorchVersion }),
+    ...(environmentReport.operatingSystem == null ? {} : { operatingSystem: environmentReport.operatingSystem }),
+    ...(environmentReport.cudaVersion == null ? {} : { cudaVersion: environmentReport.cudaVersion }),
+    ...(cudaAvailable == null ? {} : { cudaAvailable }),
+    ...(environmentReport.gpuModel == null ? {} : { gpuModel: environmentReport.gpuModel }),
+    ...(environmentReport.totalVramBytes == null ? {} : { totalVramBytes: Number(environmentReport.totalVramBytes) }),
+    ...(environmentReport.bf16Supported == null ? {} : { bf16Supported: environmentReport.bf16Supported }),
+    ...(selectedProfile == null ? {} : { selectedProfile }),
+    ...(environmentReport.fpllmVersion == null ? {} : { fpllmVersion: environmentReport.fpllmVersion }),
+    ...(environmentReport.repositoryCommit == null ? {} : { repositoryCommit: environmentReport.repositoryCommit }),
   };
   const qualification = qualifyEnvironment(input);
   const computeProfile = environmentReport.selectedProfile
