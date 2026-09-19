@@ -178,3 +178,5 @@ export class GitHubAppClient {
     return new Uint8Array(decoded);
   }
 }
+
+export * from "./user-access";

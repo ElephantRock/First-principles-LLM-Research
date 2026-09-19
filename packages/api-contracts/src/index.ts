@@ -75,10 +75,21 @@ export type ExperimentLock = z.infer<typeof experimentLockSchema>;
 export type ExperimentArtifact = z.infer<typeof experimentArtifactSchema>;
 export type InterpretationCreate = z.infer<typeof interpretationCreateSchema>;
 
-export const repositoryBindSchema = z.object({
-  installationId: z.coerce.number().int().positive(),
-  owner: z.string().min(1).max(100),
-  repo: z.string().min(1).max(100),
-  ref: z.string().min(1).max(255),
+export const repositoryDiscoverySchema = z.object({
+  owner: z.string().trim().min(1).max(100).regex(/^[A-Za-z0-9_.-]+$/),
+  repo: z.string().trim().min(1).max(100).regex(/^[A-Za-z0-9_.-]+$/),
+  ref: z.string().trim().min(1).max(255),
 });
+
+/**
+ * Binding no longer accepts a caller-supplied installation id. The authorization
+ * token is minted only after a transient GitHub App user token proves that the
+ * authenticated learner can reach the requested repository.
+ */
+export const repositoryBindSchema = z.object({
+  authorization: z.string().min(40).max(4096),
+  ref: z.string().trim().min(1).max(255),
+});
+
+export type RepositoryDiscovery = z.infer<typeof repositoryDiscoverySchema>;
 export type RepositoryBind = z.infer<typeof repositoryBindSchema>;

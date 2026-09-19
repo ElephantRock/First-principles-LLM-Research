@@ -40,7 +40,7 @@ An OAuth access token is used only to resolve the learner's GitHub profile durin
 
 ## Increment plan
 
-### V4.1 — identity/session foundation
+### V4.1 — identity/session foundation — IMPLEMENTED
 
 - GitHub OAuth start/callback routes;
 - `Identity(provider=github, providerUserId=<numeric id>)` provisioning;
@@ -49,15 +49,39 @@ An OAuth access token is used only to resolve the learner's GitHub profile durin
 - sign-in and sign-out surfaces;
 - integration tests for identity stability, token hashing, expiry and revocation.
 
-### V4.2 — remove demo actor from application services
+### V4.2 — request-scoped learner services — IMPLEMENTED
 
-Replace `*ForDemo` and `getDemoSnapshot()` application calls with explicit `userId`-scoped operations. The seed learner remains only as deterministic test fixture data.
+Production APIs and pages use explicit authenticated `userId` scopes. The seed learner remains only behind the explicit `FPLLM_DEMO_AUTH=1` migration/test escape hatch.
 
-Release gate: no production API or page may obtain authority by looking up `handle=demo`.
+The two-user isolation gate covers repositories, submissions, experiments, artifact import, interpretation, compute state and mastery evidence.
 
-### V4.3 — repository onboarding
+### V4.3 — repository onboarding — IMPLEMENTED CANDIDATE
 
-Authenticated learner -> GitHub App installation -> permitted repository -> immutable repository binding. Repository binding must remain independent from OAuth identity tokens.
+The onboarding authorization chain is:
+
+```text
+authenticated learner session
+    -> GitHub App user OAuth + PKCE
+    -> transient GitHub App user access token
+    -> verify immutable GitHub numeric user ID matches learner identity
+    -> prove user token can reach requested repository through an App installation
+    -> discard user access token
+    -> mint 10-minute server-signed, session-bound repository authorization
+    -> resolve repository again with GitHub App installation token
+    -> compare immutable repository ID
+    -> persist learner-owned Repository + RepositoryBinding
+```
+
+The repository-binding API does **not** accept a caller-supplied installation ID as authority. GitHub documents that setup URLs can be hit with spoofed `installation_id` values, so installation identity alone is insufficient. The platform therefore requires a GitHub App **user access token** to prove that the authenticated learner can access the requested repository, then discards that token rather than persisting it.
+
+The signed repository authorization is bound to the internal `userId` and current session ID, has a ten-minute expiry, and is authenticated with a server-only HMAC secret. The final bind independently resolves the repository through the installation token and compares the immutable GitHub repository ID before writing evidence state.
+
+Required deployment configuration for this flow:
+
+- GitHub App client ID and client secret;
+- GitHub App callback URL: `<FPLLM_WEB_ORIGIN>/auth/github-app/callback`;
+- GitHub App slug for the install/configure link;
+- `FPLLM_REPOSITORY_AUTH_SECRET` containing at least 32 random bytes.
 
 ### V4.4 — environment qualification
 
