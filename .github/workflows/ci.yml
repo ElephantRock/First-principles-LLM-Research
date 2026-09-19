@@ -129,4 +129,6 @@ jobs:
         run: pnpm --filter @fpllm/web exec playwright install --with-deps chromium webkit
 
       - name: End-to-end vertical slice
+        env:
+          FPLLM_E2E_AUTH: "1"
         run: pnpm --filter @fpllm/web test:e2e
