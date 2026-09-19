@@ -302,7 +302,7 @@ async function runSubmissionCase(input: {
       invariantId: result.invariantId,
       passed: result.passed,
     })),
-    jobEvents: job.events.map((event) => event.eventType),
+    jobEvents: job.events.map((event: { eventType: string }) => event.eventType),
     experimentUnlocked,
     experimentId,
     experimentError,
