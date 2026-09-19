@@ -150,14 +150,15 @@ jobs:
           docker pull "$FPLLM_TEST_RUNTIME_IMAGE"
           docker pull "$FPLLM_HIDDEN_EVALUATOR_IMAGE"
 
-      - name: Materialize private evaluator bundle
+      - name: Materialize committed private evaluator bundle
         shell: bash
         run: |
           set -euo pipefail
           private_root="$RUNNER_TEMP/fpllm-private-test-bundles"
           python scripts/staging/materialize_private_bundle.py \
             --output-root "$private_root" \
-            --bundle-id phase1-causal-attention@1.0
+            --bundle-id phase1-causal-attention@1.0 \
+            --commitment hidden-tests/phase1/causal-attention/private-bundle-commitment.json
           echo "FPLLM_PRIVATE_TEST_BUNDLE_ROOT=$private_root" >> "$GITHUB_ENV"
           echo "FPLLM_PUBLIC_TEST_BUNDLE_ROOT=$GITHUB_WORKSPACE/test-bundles/public" >> "$GITHUB_ENV"
           echo "FPLLM_WORKER_TEMP_ROOT=$RUNNER_TEMP/fpllm-worker" >> "$GITHUB_ENV"
