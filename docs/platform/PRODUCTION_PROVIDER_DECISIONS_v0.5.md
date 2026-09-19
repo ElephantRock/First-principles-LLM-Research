@@ -37,7 +37,7 @@ P0 closes provider selection against the published provider envelope recorded be
 | Canonical production origin | `https://fpllm-beta-web.ecs.eu-west-1.on.aws` | CLOSED |
 | DNS/TLS | AWS-managed ECS Express `on.aws` hostname and managed certificate; no custom domain for v0.5 | CLOSED |
 | Backup/restore | RDS automated backups/PITR, 7-day retention, pre-migration snapshots, restore-to-new-instance drill | CLOSED |
-| Release process | GitHub Actions OIDC -> AWS IAM; AWS CDK v2/TypeScript; immutable ECR digests; expand-first migrations; canary web deploy; smoke/rollback gate | CLOSED |
+| Release process | GitHub Actions OIDC -> AWS IAM; AWS CDK v2/TypeScript; immutable ECR digests; expand-first migrations; protocol-compatibility gate; canary web deploy; smoke/rollback gate | CLOSED |
 
 Any change to a CLOSED row before P7 requires a committed decision amendment explaining the failed assumption and all consequential changes.
 
@@ -488,18 +488,39 @@ Use **AWS CDK v2 in TypeScript** inside the repository. Console-only production 
 
 GitHub Actions assumes an AWS deployment role via **GitHub OIDC**. Workflows build source-SHA-attributable images, push to private ECR, record digests, and promote exact digests.
 
-### 14.3 Promotion order
+### 14.3 Web/worker protocol compatibility gate
+
+The web and worker are independently deployable, but they share durable contracts: job payload schema, test/evaluator identity, persisted state transitions, and any protocol fields consumed by `assertSandboxJob` or equivalent validation. Independent deployment is therefore permitted only across a **verified compatibility window**.
+
+Before any production promotion, CI/release evidence must record a compatibility matrix proving, as applicable:
+
+```text
+new web -> old worker: accepted
+old web -> new worker: accepted
+new web -> new worker: accepted
+rollback web -> currently deployed worker: accepted
+rollback worker -> currently deployed web/queued jobs: accepted
+```
+
+A release that changes a durable job payload, schema version, evaluator protocol, or required state semantics must either preserve enough backward/forward compatibility for the matrix above or use the coordinated breaking-change procedure below.
+
+This gate specifically prevents a new web release from creating submissions that an old worker rejects and retries as infrastructure failures.
+
+### 14.4 Normal compatible promotion order
+
+When the compatibility matrix passes:
 
 ```text
 CI + review clean
 -> freeze source SHA
 -> build/publish immutable images
 -> record ECR digests
+-> verify web/worker compatibility matrix
 -> pre-migration RDS snapshot when required
 -> version-controlled expand-compatible Prisma migration
 -> verify migration
 -> ECS Express canary web deploy
--> production smoke gate
+-> production web smoke gate
 -> worker/runtime/evaluator digest update
 -> queue/worker smoke gate
 -> record release identities/evidence
@@ -507,7 +528,22 @@ CI + review clean
 
 Migrations run as a one-off Fargate task in the VPC using the separate migration role. Manual SQL absent from version control is prohibited.
 
-### 14.4 Smoke gate
+### 14.5 Breaking protocol/schema promotion
+
+If old/new web and worker versions cannot safely coexist, the release is **coordinated**, not rolling:
+
+1. put submission creation into an explicit maintenance/drain mode while preserving read access to existing learner evidence;
+2. allow all leased and queued submission-test jobs to reach a terminal state, or deliberately cancel only through a versioned/diagnostic product path that preserves evidence provenance;
+3. verify the durable queue is drained and no old-contract job remains eligible for lease;
+4. apply only expand-compatible database migration steps required by both sides of the coordinated release;
+5. replace worker/runtime/evaluator to the new contract while submissions remain paused;
+6. deploy the new web digest while submissions remain paused;
+7. run web + queue + worker compatibility/smoke checks using the new contract;
+8. reopen submission creation only after the checks pass and record the maintenance window/evidence.
+
+A breaking release must not consume learner retry budgets merely because components were temporarily protocol-incompatible.
+
+### 14.6 Smoke gate
 
 At minimum verify:
 
@@ -515,16 +551,20 @@ At minimum verify:
 - `NODE_ENV=production` and production fixture authority impossible;
 - DB connectivity and expected migration identity;
 - deployed image digests equal candidate record;
+- compatibility matrix or coordinated-release evidence matches the chosen release path;
 - queue accepts/leases a controlled diagnostic job without fixture-derived learner authority;
 - worker host/runtime preflight passes, including gVisor and digest identities;
 - no production secret/hidden fixture appears in logs.
 
 P2/P3 real learner/repository/submission evidence remains separate and cannot be replaced by infrastructure smoke tests.
 
-### 14.5 Rollback
+### 14.7 Rollback compatibility
 
-- web: ECS Express alarm rollback or previous ECR digest;
-- worker: previous worker/runtime/evaluator digests and worker launch configuration;
+Rollback is permitted independently only when the recorded compatibility matrix proves the rollback pair can safely consume all currently queued/durable work.
+
+- web: ECS Express alarm rollback or previous ECR digest **only if** that web digest is compatible with the deployed worker and current durable job/state contract;
+- worker: previous worker/runtime/evaluator digests **only if** they accept all durable jobs that may have been created by the deployed web;
+- incompatible rollback: pause submissions, drain/terminalize work under supported product semantics, then perform a coordinated web+worker rollback and smoke gate;
 - database: forward-compatible migrations preferred; no destructive evidence down-migration. If recovery is necessary, restore snapshot/PITR to a new instance.
 
 Release PRs follow the post-PR-#9 process rule: inspect/disposition all automated/human findings, rerun affected gates, then resolve review threads and merge.
@@ -554,7 +594,7 @@ The review threshold is not an automatic resource kill switch. Active learner ev
 
 | Failure | Expected response |
 |---|---|
-| ECS bad release | canary/alarm rollback or previous digest |
+| ECS bad release | canary/alarm rollback or previous digest, subject to §14.7 compatibility |
 | ECS task/AZ failure | managed task replacement/load balancing |
 | RDS instance/AZ failure | beta outage accepted; restore/PITR if necessary |
 | EC2 worker loss | ASG replaces host; durable lease/retry returns work to diagnosable state |
@@ -590,9 +630,9 @@ P1 must implement and verify, without silently changing P0:
 8. hidden-evaluator image build that embeds private evaluator material and removes the normal production host-mounted private-bundle dependency;
 9. Secrets Manager/IAM least privilege plus exercised rotation runbook;
 10. structured logs/metrics/correlation/trace plumbing and minimum operator dashboard;
-11. release/migration/smoke/rollback automation;
+11. release/migration/smoke/rollback automation including the §14 web/worker compatibility matrix and breaking-change drain path;
 12. clean-environment provisioning test, backup/restore drill and rollback drill;
-13. retained P1 evidence: quotas, Pricing Calculator estimate, resource IDs, image digests, migration ID, restore timings and rollback result.
+13. retained P1 evidence: quotas, Pricing Calculator estimate, resource IDs, image digests, migration ID, compatibility evidence, restore timings and rollback result.
 
 P1 is not complete until those operations are exercised against the selected production environment. A merged CDK stack alone is not P1 evidence.
 
