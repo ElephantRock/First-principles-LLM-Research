@@ -263,6 +263,12 @@ function readCudaMarker(reportJson: unknown) {
   return typeof value === "boolean" ? value : undefined;
 }
 
+function readEnvironmentReportId(evidenceJson: unknown) {
+  if (!evidenceJson || typeof evidenceJson !== "object" || Array.isArray(evidenceJson)) return null;
+  const value = (evidenceJson as Record<string, unknown>).environmentReportId;
+  return typeof value === "string" ? value : null;
+}
+
 export async function getLatestEnvironmentQualificationForUser(userId: string) {
   const environmentReport = await prisma.environmentReport.findFirst({
     where: { userId },
@@ -288,9 +294,10 @@ export async function getLatestEnvironmentQualificationForUser(userId: string) {
     ...(environmentReport.repositoryCommit == null ? {} : { repositoryCommit: environmentReport.repositoryCommit }),
   };
   const qualification = qualifyEnvironment(input);
-  const computeProfile = environmentReport.selectedProfile
-    ? await prisma.computeProfile.findFirst({ where: { userId }, orderBy: { createdAt: "desc" } })
-    : null;
+  const computeProfiles = environmentReport.selectedProfile
+    ? await prisma.computeProfile.findMany({ where: { userId }, orderBy: { createdAt: "desc" } })
+    : [];
+  const computeProfile = computeProfiles.find((profile) => readEnvironmentReportId(profile.evidenceJson) === environmentReport.id) ?? null;
 
   return { environmentReport, computeProfile, qualification };
 }
