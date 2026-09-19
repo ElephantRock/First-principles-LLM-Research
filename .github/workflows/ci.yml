@@ -31,6 +31,7 @@ jobs:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/fpllm?schema=public
       COURSE_CONTENT_ROOT: ./course
       FPLLM_DEMO_HANDLE: demo
+      FPLLM_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
 
     steps:
       - name: Checkout
@@ -74,14 +75,24 @@ jobs:
             infra/docker/test-runtime/probe/serve.py \
             infra/docker/test-runtime/probe/adapters/causal_attention_v1.py \
             test-bundles/public/phase1-causal-attention@1.0/runner.py \
-            scripts/ci/probe_memory_trace_client.py
+            scripts/ci/probe_memory_trace_client.py \
+            scripts/ci/inspect_sandbox_topology.py \
+            scripts/release/runtime_image_provenance.py
           python -m unittest discover \
             -s infra/docker/test-runtime/tests \
             -p 'test_*.py' \
             -v
 
-      - name: Validate executable Causal Attention runtime image
+      - name: Validate executable Causal Attention runtime images
         run: bash scripts/ci/validate_causal_attention_runtime.sh
+
+      - name: Upload runtime release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-release-evidence-${{ github.run_id }}
+          path: .artifacts/runtime-release/
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Typecheck
         run: pnpm typecheck
