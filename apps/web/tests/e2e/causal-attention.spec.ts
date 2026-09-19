@@ -50,6 +50,7 @@ test("application shell exposes POST sign-out and revokes the bearer session", a
   await page.goto("/home");
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page).toHaveURL(/\/auth\/sign-in$/);
+  await expect(page.getByRole("button", { name: "Sign out" })).toHaveCount(0);
 
   const me = await context.request.get(`${BASE_URL}/api/v1/me`);
   expect(me.status()).toBe(401);
