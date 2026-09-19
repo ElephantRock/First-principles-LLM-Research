@@ -212,7 +212,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$FPLLM_WORKER_TEMP_ROOT"
-          pnpm --dir packages/db exec tsx ../../apps/worker/src/staging.ts
+          test -x packages/db/node_modules/.bin/tsx
+          packages/db/node_modules/.bin/tsx apps/worker/src/staging.ts
 
       - name: Bind staging artifact to candidate source commit
         shell: bash
