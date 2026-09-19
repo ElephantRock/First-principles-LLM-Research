@@ -1,0 +1,132 @@
+name: Runtime image release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push the validated images to GHCR"
+        required: true
+        type: boolean
+        default: false
+      confirm_publish:
+        description: "When publish=true, enter PUBLISH"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  runtime-images:
+    runs-on: ubuntu-24.04
+    env:
+      FPLLM_SOURCE_COMMIT: ${{ github.sha }}
+      LEARNER_LOCAL_IMAGE: fpllm/test-runtime:ci
+      EVALUATOR_LOCAL_IMAGE: fpllm/hidden-evaluator:ci
+      LEARNER_REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/fpllm-test-runtime
+      EVALUATOR_REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/fpllm-hidden-evaluator
+
+    steps:
+      - name: Checkout selected immutable source revision
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate release-candidate images and evidence
+        run: bash scripts/ci/validate_causal_attention_runtime.sh
+
+      - name: Require explicit publication confirmation
+        if: ${{ inputs.publish }}
+        shell: bash
+        run: |
+          if [[ "${{ inputs.confirm_publish }}" != "PUBLISH" ]]; then
+            echo "publish=true requires confirm_publish=PUBLISH" >&2
+            exit 1
+          fi
+
+      - name: Login to GHCR
+        if: ${{ inputs.publish }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish digest-addressable runtime images
+        if: ${{ inputs.publish }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${FPLLM_SOURCE_COMMIT:0:12}"
+          learner_tag="${LEARNER_REGISTRY_IMAGE}:rc-${short_sha}"
+          evaluator_tag="${EVALUATOR_REGISTRY_IMAGE}:rc-${short_sha}"
+
+          docker tag "$LEARNER_LOCAL_IMAGE" "$learner_tag"
+          docker tag "$EVALUATOR_LOCAL_IMAGE" "$evaluator_tag"
+          docker push "$learner_tag"
+          docker push "$evaluator_tag"
+
+          learner_ref="$(docker image inspect "$learner_tag" --format '{{index .RepoDigests 0}}')"
+          evaluator_ref="$(docker image inspect "$evaluator_tag" --format '{{index .RepoDigests 0}}')"
+          learner_digest="${learner_ref##*@}"
+          evaluator_digest="${evaluator_ref##*@}"
+
+          if [[ ! "$learner_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || [[ ! "$evaluator_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "registry did not return immutable sha256 digests" >&2
+            exit 1
+          fi
+
+          python scripts/release/runtime_image_provenance.py \
+            --image "$learner_tag" \
+            --role learner-runtime \
+            --dockerfile infra/docker/test-runtime/Dockerfile \
+            --input infra/docker/test-runtime/probe \
+            --source-commit "$FPLLM_SOURCE_COMMIT" \
+            --registry-digest "$learner_digest" \
+            --output .artifacts/runtime-release/learner-runtime.published.provenance.json
+
+          python scripts/release/runtime_image_provenance.py \
+            --image "$evaluator_tag" \
+            --role hidden-evaluator \
+            --dockerfile infra/docker/hidden-evaluator/Dockerfile \
+            --source-commit "$FPLLM_SOURCE_COMMIT" \
+            --registry-digest "$evaluator_digest" \
+            --output .artifacts/runtime-release/hidden-evaluator.published.provenance.json
+
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path('.artifacts/runtime-release')
+          learner = json.loads((root / 'learner-runtime.published.provenance.json').read_text())
+          evaluator = json.loads((root / 'hidden-evaluator.published.provenance.json').read_text())
+          release = {
+              'schemaVersion': '1',
+              'kind': 'fpllm-runtime-image-release-candidate',
+              'sourceCommit': os.environ['FPLLM_SOURCE_COMMIT'],
+              'learnerRuntime': {
+                  'repository': os.environ['LEARNER_REGISTRY_IMAGE'],
+                  'digest': learner['distribution']['registryDigest'],
+              },
+              'hiddenEvaluator': {
+                  'repository': os.environ['EVALUATOR_REGISTRY_IMAGE'],
+                  'digest': evaluator['distribution']['registryDigest'],
+              },
+              'testBundleId': 'phase1-causal-attention@1.0',
+              'adapterInterface': 'causal-attention-v1',
+              'memoryTraceSchema': '2',
+          }
+          (root / 'published-release-candidate.json').write_text(json.dumps(release, indent=2, sort_keys=True) + '\n')
+          PY
+
+      - name: Upload runtime release-candidate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-release-candidate-${{ github.run_id }}
+          path: .artifacts/runtime-release/
+          if-no-files-found: error
+          retention-days: 30
