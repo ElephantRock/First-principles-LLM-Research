@@ -1,0 +1,187 @@
+name: v0.3 Staging Frozen Candidate bc11aa1f
+
+on:
+  push:
+    branches:
+      - release/v0.3-staging-bc11aa1f
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  staging-e2e:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fpllm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d fpllm"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      CANDIDATE_SHA: bc11aa1fb644c41d1335b4217d8e8fb2b2735439
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/fpllm?schema=public
+      COURSE_CONTENT_ROOT: ./course
+      FPLLM_DEMO_HANDLE: demo
+      GITHUB_APP_ID: ${{ secrets.FPLLM_STAGING_GITHUB_APP_ID }}
+      GITHUB_APP_PRIVATE_KEY: ${{ secrets.FPLLM_STAGING_GITHUB_APP_PRIVATE_KEY }}
+      FPLLM_STAGING_GITHUB_INSTALLATION_ID: ${{ secrets.FPLLM_STAGING_GITHUB_INSTALLATION_ID }}
+      FPLLM_STAGING_REPOSITORY_OWNER: ElephantRock
+      FPLLM_STAGING_REPOSITORY_NAME: First-principles-LLM-Research
+      FPLLM_STAGING_GOOD_SHA: c29f8a28cb56d2b50d5139bae1a7747ddf495c89
+      FPLLM_STAGING_BAD_SHA: 3ccf5ba08f37c5d35b56e66b9e78993eb117d93f
+      FPLLM_TEST_RUNTIME_IMAGE: ghcr.io/elephantrock/fpllm-test-runtime@sha256:accf397021bb62f78c908de8260053b87fd4fc0664cd0df49ea69b4589f52ea2
+      FPLLM_HIDDEN_EVALUATOR_IMAGE: ghcr.io/elephantrock/fpllm-hidden-evaluator@sha256:ff150b597e2727a5e3f409aa7dabcefef83cada3f5e00070418c46cb0994f0f9
+      FPLLM_PRIVATE_BUNDLE_TAR_B64: ${{ secrets.FPLLM_PRIVATE_BUNDLE_TAR_B64 }}
+      FPLLM_WORKER_LEASE_SECONDS: "300"
+      FPLLM_WORKER_POLL_MS: "250"
+      FPLLM_WORKER_ONCE: "1"
+
+    steps:
+      - name: Require configured staging secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in GITHUB_APP_ID GITHUB_APP_PRIVATE_KEY FPLLM_STAGING_GITHUB_INSTALLATION_ID FPLLM_PRIVATE_BUNDLE_TAR_B64; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "$name is not configured" >&2
+              exit 1
+            fi
+          done
+
+      - name: Checkout frozen candidate
+        uses: actions/checkout@v4
+        with:
+          ref: bc11aa1fb644c41d1335b4217d8e8fb2b2735439
+          fetch-depth: 1
+
+      - name: Verify frozen candidate identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$CANDIDATE_SHA"
+          echo "FPLLM_STAGING_CANDIDATE_SHA=$actual" >> "$GITHUB_ENV"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.1
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate staging machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f apps/worker/src/staging.ts
+          test -f scripts/ops/verify_worker_host.py
+          test -f scripts/staging/materialize_private_bundle.py
+          test -f hidden-tests/phase1/causal-attention/private-bundle-commitment.json
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm db:generate
+
+      - name: Apply database migration
+        run: pnpm --filter @fpllm/db exec prisma migrate deploy
+
+      - name: Seed staging database
+        run: pnpm db:seed
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull immutable runtime images
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$FPLLM_TEST_RUNTIME_IMAGE"
+          docker pull "$FPLLM_HIDDEN_EVALUATOR_IMAGE"
+
+      - name: Materialize committed private evaluator bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          private_root="$RUNNER_TEMP/fpllm-private-test-bundles"
+          python scripts/staging/materialize_private_bundle.py \
+            --output-root "$private_root" \
+            --bundle-id phase1-causal-attention@1.0 \
+            --commitment hidden-tests/phase1/causal-attention/private-bundle-commitment.json
+          echo "FPLLM_PRIVATE_TEST_BUNDLE_ROOT=$private_root" >> "$GITHUB_ENV"
+          echo "FPLLM_PUBLIC_TEST_BUNDLE_ROOT=$GITHUB_WORKSPACE/test-bundles/public" >> "$GITHUB_ENV"
+          echo "FPLLM_WORKER_TEMP_ROOT=$RUNNER_TEMP/fpllm-worker" >> "$GITHUB_ENV"
+          echo "FPLLM_STAGING_EVIDENCE_PATH=$GITHUB_WORKSPACE/.artifacts/staging/staging-submission-e2e.json" >> "$GITHUB_ENV"
+
+      - name: Verify digest-pinned worker-host boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$FPLLM_WORKER_TEMP_ROOT" .artifacts/staging
+          python scripts/ops/verify_worker_host.py \
+            --learner-image "$FPLLM_TEST_RUNTIME_IMAGE" \
+            --evaluator-image "$FPLLM_HIDDEN_EVALUATOR_IMAGE" \
+            --worker-temp-root "$FPLLM_WORKER_TEMP_ROOT" \
+            --public-bundle-root "$FPLLM_PUBLIC_TEST_BUNDLE_ROOT" \
+            --private-bundle-root "$FPLLM_PRIVATE_TEST_BUNDLE_ROOT" \
+            --output .artifacts/staging/worker-host-preflight.json
+
+      - name: Execute real GitHub App worker path
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$FPLLM_WORKER_TEMP_ROOT"
+          test -x packages/db/node_modules/.bin/tsx
+          packages/db/node_modules/.bin/tsx apps/worker/src/staging.ts
+
+      - name: Bind staging artifacts to frozen candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          root = Path('.artifacts/staging')
+          candidate = {
+              'sourceCommit': os.environ['CANDIDATE_SHA'],
+              'trigger': 'explicit-chat-authorized-one-shot',
+          }
+          for name in ('worker-host-preflight.json', 'staging-submission-e2e.json'):
+              path = root / name
+              doc = json.loads(path.read_text())
+              doc['candidate'] = candidate
+              path.write_text(json.dumps(doc, indent=2, sort_keys=True) + '\n')
+          PY
+
+      - name: Upload staging evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: v03-staging-bc11aa1f-${{ github.run_id }}
+          path: .artifacts/staging/
+          if-no-files-found: error
+          retention-days: 30
