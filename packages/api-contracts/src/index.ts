@@ -59,6 +59,7 @@ export const environmentReportSchema = z.object({
   pytorchVersion: z.string().optional(),
   operatingSystem: z.string().optional(),
   cudaVersion: z.string().optional(),
+  cudaAvailable: z.boolean().optional(),
   gpuModel: z.string().optional(),
   totalVramBytes: z.number().int().nonnegative().optional(),
   bf16Supported: z.boolean().optional(),
@@ -74,6 +75,7 @@ export type ExperimentCreate = z.infer<typeof experimentCreateSchema>;
 export type ExperimentLock = z.infer<typeof experimentLockSchema>;
 export type ExperimentArtifact = z.infer<typeof experimentArtifactSchema>;
 export type InterpretationCreate = z.infer<typeof interpretationCreateSchema>;
+export type EnvironmentReport = z.infer<typeof environmentReportSchema>;
 
 export const repositoryDiscoverySchema = z.object({
   owner: z.string().trim().min(1).max(100).regex(/^[A-Za-z0-9_.-]+$/),
