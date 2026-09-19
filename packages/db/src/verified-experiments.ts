@@ -11,7 +11,7 @@ const requiredInvariantIds = [
 ] as const;
 
 type RequiredTestResult = {
-  invariantId: string;
+  invariantId: string | null;
   passed: boolean;
 };
 
@@ -34,7 +34,9 @@ export async function createVerifiedExperimentForUser(userId: string, submission
   const passingRun = submission.testRuns[0];
   if (!passingRun) throw new Error("PASSING_TEST_RUN_REQUIRED");
   const resultByInvariant = new Map<string, RequiredTestResult>(
-    passingRun.results.map((result: RequiredTestResult) => [result.invariantId, result]),
+    passingRun.results.flatMap((result: RequiredTestResult) =>
+      result.invariantId ? [[result.invariantId, result] as [string, RequiredTestResult]] : [],
+    ),
   );
   const completePass = requiredInvariantIds.every((id) => resultByInvariant.get(id)?.passed === true);
   if (!completePass) throw new Error("REQUIRED_TEST_EVIDENCE_INCOMPLETE");
