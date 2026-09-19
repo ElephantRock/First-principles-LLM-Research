@@ -1,50 +1,55 @@
 import { expect, test, type BrowserContext } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import {
-  createSessionForUser,
-  getDemoUser,
-  prisma,
-  provisionGitHubIdentity,
-  revokeSessionToken,
-} from "@fpllm/db";
 
 const BASE_URL = "http://127.0.0.1:3000";
 
-async function authenticate(context: BrowserContext, userId: string) {
-  const { token } = await createSessionForUser(userId, { ttlMs: 10 * 60 * 1000 });
-  await context.addCookies([{
-    name: "fpllm_session",
-    value: token,
-    url: BASE_URL,
-    httpOnly: true,
-    sameSite: "Lax",
-  }]);
-  return token;
+type FixtureMode = "demo" | "fresh";
+
+async function authenticate(context: BrowserContext, mode: FixtureMode) {
+  const response = await context.request.post(`${BASE_URL}/api/v1/__test__/session`, {
+    data: { mode },
+  });
+  expect(response.status()).toBe(201);
+  const body = await response.json() as {
+    ok: boolean;
+    mode: FixtureMode;
+    user: { id: string; handle: string; displayName: string | null };
+  };
+  expect(body.ok).toBe(true);
+  expect(body.mode).toBe(mode);
+  return body.user;
+}
+
+async function signOut(context: BrowserContext) {
+  const response = await context.request.delete(`${BASE_URL}/api/v1/__test__/session`);
+  expect(response.status()).toBe(200);
 }
 
 test("vertical slice uses a real bearer session rather than demo auth fallback", async ({ page, context }) => {
-  const demo = await getDemoUser();
-  const token = await authenticate(context, demo.id);
+  await authenticate(context, "demo");
   try {
+    const me = await context.request.get(`${BASE_URL}/api/v1/me`);
+    expect(me.status()).toBe(200);
+
     await page.goto("/home");
     await expect(page.getByRole("heading", { name: "Continue the evidence loop." })).toBeVisible();
     await page.getByRole("link", { name: "Lock experiment" }).click();
     await expect(page.getByRole("heading", { name: "Attention Memory Scaling" })).toBeVisible();
   } finally {
-    await revokeSessionToken(token);
+    await signOut(context);
   }
 });
 
 test("fresh authenticated learner reaches zero-state onboarding and records compute evidence", async ({ page, context }) => {
-  const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const user = await provisionGitHubIdentity({
-    providerUserId: `playwright-${suffix}`,
-    login: `playwright-${suffix}`,
-    displayName: "Playwright Fresh Learner",
-  });
-  const token = await authenticate(context, user.id);
+  const user = await authenticate(context, "fresh");
 
   try {
+    const me = await context.request.get(`${BASE_URL}/api/v1/me`);
+    expect(me.status()).toBe(200);
+    const meBody = await me.json() as { authenticated: boolean; user: { id: string } };
+    expect(meBody.authenticated).toBe(true);
+    expect(meBody.user.id).toBe(user.id);
+
     await page.goto("/home");
     await expect(page.getByText("No experiment yet")).toBeVisible();
     await expect(page.getByText("No GPU report")).toBeVisible();
@@ -83,23 +88,17 @@ test("fresh authenticated learner reaches zero-state onboarding and records comp
     await expect(page.getByText("cuda required later")).toBeVisible();
     await expect(page.getByText(/CUDA is not currently available/)).toBeVisible();
   } finally {
-    await revokeSessionToken(token);
-    await prisma.computeProfile.deleteMany({ where: { userId: user.id } });
-    await prisma.environmentReport.deleteMany({ where: { userId: user.id } });
-    await prisma.auditEvent.deleteMany({ where: { actorUserId: user.id } });
-    await prisma.identity.deleteMany({ where: { userId: user.id } });
-    await prisma.user.delete({ where: { id: user.id } });
+    await signOut(context);
   }
 });
 
 test("learning unit has no automatically detectable accessibility violations", async ({ page, context }) => {
-  const demo = await getDemoUser();
-  const token = await authenticate(context, demo.id);
+  await authenticate(context, "demo");
   try {
     await page.goto("/learn/phase-1/causal-attention");
     const results = await new AxeBuilder({ page }).analyze();
     expect(results.violations).toEqual([]);
   } finally {
-    await revokeSessionToken(token);
+    await signOut(context);
   }
 });
