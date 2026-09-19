@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "1",
+  "testBundleId": "phase1-causal-attention@1.0",
+  "privateEvaluatorVersion": "1.0.0",
+  "archiveFormat": "tar.gz",
+  "archiveSha256": "42c57f9fbd7650565c0d5bc6954b732a0cdfd3062388d8b2995f4f58b5ff23f8",
+  "archiveBytes": 4473,
+  "adapterInterface": "causal-attention-v1",
+  "memoryTraceSchema": "2",
+  "hiddenInvariants": [
+    "attention.randomized_numerics",
+    "attention.no_permanent_kv_repeat"
+  ],
+  "visibilityNote": "This file is a cryptographic commitment to the private evaluator bundle. Evaluator source, randomized fixtures, and seeds are intentionally not stored in this public repository."
+}
