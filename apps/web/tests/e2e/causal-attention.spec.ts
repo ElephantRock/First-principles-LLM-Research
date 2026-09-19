@@ -50,9 +50,14 @@ test("fresh learner completes no-seed onboarding through queued, running, and ev
   try {
     const me = await context.request.get(`${BASE_URL}/api/v1/me`);
     expect(me.status()).toBe(200);
-    const meBody = await me.json() as { authenticated: boolean; user: { id: string } };
-    expect(meBody.authenticated).toBe(true);
+    const meBody = await me.json() as {
+      ok: boolean;
+      user: { id: string };
+      session: { id: string; expiresAt: string } | null;
+    };
+    expect(meBody.ok).toBe(true);
     expect(meBody.user.id).toBe(user.id);
+    expect(meBody.session).not.toBeNull();
 
     await page.goto("/home");
     await expect(page.getByText("No experiment yet")).toBeVisible();
