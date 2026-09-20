@@ -60,6 +60,9 @@ READ_ONLY_AWS_OPERATIONS = {
     ("rds", "describe-db-snapshots"),
     ("codebuild", "list-projects"),
     ("lambda", "get-account-settings"),
+    ("lambda", "list-functions"),
+    ("lambda", "get-function-concurrency"),
+    ("lambda", "list-provisioned-concurrency-configs"),
     ("dynamodb", "list-tables"),
     ("ecs", "describe-express-gateway-service"),
 }
@@ -178,6 +181,19 @@ def rds_db_connect_resource_template(account: str) -> str:
     return f"arn:aws:rds-db:{REGION}:{account}:dbuser:<DBI_RESOURCE_ID>/{INCIDENT_DB_USER}"
 
 
+def rds_db_connect_policy_template(account: str) -> dict[str, Any]:
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["rds-db:connect"],
+                "Resource": [rds_db_connect_resource_template(account)],
+            }
+        ],
+    }
+
+
 def planned_topology(account: str) -> dict[str, Any]:
     return {
         "vpcCidr": VPC_CIDR,
@@ -197,6 +213,7 @@ def planned_topology(account: str) -> dict[str, Any]:
             "dbUser": INCIDENT_DB_USER,
             "maxConcurrentDbSessions": INCIDENT_MEDIATOR_MAX_DB_SESSIONS,
             "rdsDbConnectResourceTemplate": rds_db_connect_resource_template(account),
+            "rdsDbConnectPolicyTemplate": rds_db_connect_policy_template(account),
         },
     }
 
@@ -229,6 +246,7 @@ def evaluate(
     quotas = observed.get("quotas") or {}
     usage = observed.get("usage") or {}
     lambda_settings = observed.get("lambdaAccountSettings") or {}
+    lambda_allocations = observed.get("lambdaConcurrencyAllocations") or {}
     enabled_azs = set(observed.get("enabledAvailabilityZones") or [])
     worker_offerings = set(observed.get("m7iOfferings") or [])
     rds_options = observed.get("rdsOrderableOptions") or []
@@ -308,12 +326,51 @@ def evaluate(
 
     lambda_limit = lambda_settings.get("AccountLimit") or {}
     unreserved = lambda_limit.get("UnreservedConcurrentExecutions")
+    total_concurrency = lambda_limit.get("ConcurrentExecutions")
+    total_reserved = lambda_allocations.get("totalReservedConcurrency")
+    total_provisioned = lambda_allocations.get("totalProvisionedConcurrency")
+    pc_not_covered = lambda_allocations.get("provisionedConcurrencyNotCoveredByReserved")
+
+    numeric_lambda_inventory = all(
+        isinstance(value, (int, float))
+        for value in (unreserved, total_concurrency, total_reserved, total_provisioned, pc_not_covered)
+    )
+    reserved_implied_by_account = (
+        int(total_concurrency) - int(unreserved) if numeric_lambda_inventory else None
+    )
+    add(
+        "quota.lambda-reserved-inventory-consistent",
+        numeric_lambda_inventory
+        and int(total_reserved) == reserved_implied_by_account
+        and 0 <= int(pc_not_covered) <= int(total_provisioned),
+        {
+            "accountConcurrentExecutions": total_concurrency,
+            "accountUnreservedConcurrentExecutions": unreserved,
+            "reservedConcurrencyImpliedByAccountSettings": reserved_implied_by_account,
+            "enumeratedReservedConcurrency": total_reserved,
+            "enumeratedProvisionedConcurrency": total_provisioned,
+            "provisionedConcurrencyNotCoveredByReserved": pc_not_covered,
+        },
+        "enumerated reserved concurrency == account total - account unreserved; provisioned-only claim is bounded by enumerated provisioned concurrency",
+        "R19 requires the report to retain existing reserved/provisioned allocation state; disagreement is treated as a race/incomplete inventory and fails closed.",
+    )
+
+    effective_unreserved_after_existing_pc = (
+        int(unreserved) - int(pc_not_covered) if numeric_lambda_inventory else None
+    )
     add(
         "quota.lambda-reserved-concurrency",
-        isinstance(unreserved, (int, float)) and unreserved >= 100 + PROTECTED_LAMBDA_COUNT,
-        {"concurrentExecutions": lambda_limit.get("ConcurrentExecutions"), "unreservedConcurrentExecutions": unreserved},
-        f">= {100 + PROTECTED_LAMBDA_COUNT} currently unreserved",
-        "Six one-unit protected reservations must leave at least 100 unreserved.",
+        numeric_lambda_inventory
+        and effective_unreserved_after_existing_pc is not None
+        and effective_unreserved_after_existing_pc >= 100 + PROTECTED_LAMBDA_COUNT,
+        {
+            "unreservedFromAccountSettings": unreserved,
+            "provisionedConcurrencyNotCoveredByReserved": pc_not_covered,
+            "effectiveUnreservedAfterExistingProvisionedConcurrency": effective_unreserved_after_existing_pc,
+            "protectedReservationsRequested": PROTECTED_LAMBDA_COUNT,
+        },
+        f">= {100 + PROTECTED_LAMBDA_COUNT} effective unreserved after existing provisioned-only allocations",
+        "Six new one-unit protected reservations must remain possible while preserving at least 100 unreserved concurrency; provisioned concurrency outside existing reservations is deducted conservatively.",
     )
 
     ddb_quota = applied("dynamodb", "Maximum number of tables", "Tables per Region")
@@ -402,6 +459,15 @@ def evaluate(
     add("topology.rds-iam-database-auth-plan", incident["rdsIamDatabaseAuthentication"] is True and incident["dbUser"] == INCIDENT_DB_USER, {"enabledInPlan": incident["rdsIamDatabaseAuthentication"], "dbUser": incident["dbUser"]}, {"enabledInPlan": True, "dbUser": INCIDENT_DB_USER}, "Post-create evidence must prove the realized RDS setting and grants.")
     template = rds_db_connect_resource_template(account)
     add("topology.rds-db-connect-resource-template", incident["rdsDbConnectResourceTemplate"] == template, incident["rdsDbConnectResourceTemplate"], template, "The DBI resource ID placeholder must be replaced with the created primary's exact resource ID before IAM policy acceptance.")
+    policy_template = rds_db_connect_policy_template(account)
+    add(
+        "topology.rds-db-connect-policy-template",
+        incident.get("rdsDbConnectPolicyTemplate") == policy_template
+        and "*" not in json.dumps(incident.get("rdsDbConnectPolicyTemplate"), sort_keys=True),
+        incident.get("rdsDbConnectPolicyTemplate"),
+        policy_template,
+        "The pre-create IAM template is bounded to exact action rds-db:connect and the account/region/user-specific resource template; post-create proof substitutes only the DBI resource ID.",
+    )
     add("topology.rds-incident-connection-budget", incident["maxConcurrentDbSessions"] == INCIDENT_MEDIATOR_MAX_DB_SESSIONS, incident["maxConcurrentDbSessions"], "exactly one concurrent fence-only session", "Live max_connections/headroom remains post-create evidence.")
 
     summary = {
@@ -414,6 +480,7 @@ def evaluate(
         "privateSubnetUsableIpv4": subnet_capacity,
         "interfaceEndpointCountRequired": interface_required,
         "protectedLambdaReservedConcurrencyUnits": PROTECTED_LAMBDA_COUNT,
+        "lambdaEffectiveUnreservedAfterExistingProvisionedConcurrency": effective_unreserved_after_existing_pc,
     }
     return checks, summary
 
@@ -496,14 +563,105 @@ def service_quotas(cli: AwsCli, service_code: str) -> list[dict[str, Any]]:
     defaults = default_doc.get("Quotas")
     if not isinstance(applied, list) or not isinstance(defaults, list):
         raise AdmissionError(f"missing service quotas for {service_code}")
+
+    def key(quota: dict[str, Any]) -> str:
+        code = quota.get("QuotaCode")
+        if isinstance(code, str) and code:
+            return f"code:{code}"
+        return f"name:{normalize_name(str(quota.get('QuotaName', '')))}"
+
     merged: dict[str, dict[str, Any]] = {}
     for quota in defaults:
-        code = quota.get("QuotaCode") or f"default:{quota.get('QuotaName')}"
-        merged[str(code)] = {**quota, "fpllmValueSource": "aws-default"}
+        merged[key(quota)] = {**quota, "fpllmValueSource": "aws-default"}
     for quota in applied:
-        code = quota.get("QuotaCode") or f"applied:{quota.get('QuotaName')}"
-        merged[str(code)] = {**quota, "fpllmValueSource": "applied"}
+        merged[key(quota)] = {**quota, "fpllmValueSource": "applied"}
     return list(merged.values())
+
+
+def collect_lambda_concurrency_allocations(cli: AwsCli) -> dict[str, Any]:
+    functions_doc = cli.run_json("lambda", "list-functions")
+    functions = functions_doc.get("Functions")
+    if not isinstance(functions, list):
+        raise AdmissionError("lambda list-functions response is missing Functions")
+
+    records: list[dict[str, Any]] = []
+    total_reserved = 0
+    total_provisioned = 0
+    provisioned_not_covered = 0
+
+    for function in functions:
+        name = function.get("FunctionName")
+        if not isinstance(name, str) or not name:
+            raise AdmissionError(f"lambda function inventory contains invalid FunctionName: {name!r}")
+
+        concurrency_doc = cli.run_json("lambda", "get-function-concurrency", "--function-name", name)
+        reserved_value = concurrency_doc.get("ReservedConcurrentExecutions", 0)
+        if not isinstance(reserved_value, (int, float)) or int(reserved_value) < 0:
+            raise AdmissionError(f"invalid reserved concurrency for {name!r}: {reserved_value!r}")
+        reserved = int(reserved_value)
+
+        provisioned_doc = cli.run_json(
+            "lambda", "list-provisioned-concurrency-configs", "--function-name", name
+        )
+        configs = provisioned_doc.get("ProvisionedConcurrencyConfigs")
+        if not isinstance(configs, list):
+            raise AdmissionError(f"lambda provisioned-concurrency response missing configs for {name!r}")
+
+        config_records: list[dict[str, Any]] = []
+        function_provisioned_claim = 0
+        for config in configs:
+            values: list[int] = []
+            for field in (
+                "RequestedProvisionedConcurrentExecutions",
+                "AllocatedProvisionedConcurrentExecutions",
+                "AvailableProvisionedConcurrentExecutions",
+            ):
+                raw = config.get(field, 0)
+                if not isinstance(raw, (int, float)) or int(raw) < 0:
+                    raise AdmissionError(
+                        f"invalid Lambda provisioned concurrency {field} for {name!r}: {raw!r}"
+                    )
+                values.append(int(raw))
+            claim = max(values)
+            function_provisioned_claim += claim
+            config_records.append(
+                {
+                    "functionArn": config.get("FunctionArn"),
+                    "requested": values[0],
+                    "allocated": values[1],
+                    "available": values[2],
+                    "conservativeClaim": claim,
+                    "status": config.get("Status"),
+                }
+            )
+
+        if reserved > 0 and function_provisioned_claim > reserved:
+            raise AdmissionError(
+                f"Lambda provisioned concurrency exceeds reserved concurrency for {name!r}: "
+                f"provisioned={function_provisioned_claim} reserved={reserved}"
+            )
+
+        total_reserved += reserved
+        total_provisioned += function_provisioned_claim
+        uncovered = function_provisioned_claim if reserved == 0 else 0
+        provisioned_not_covered += uncovered
+        records.append(
+            {
+                "functionName": name,
+                "reservedConcurrency": reserved,
+                "provisionedConcurrencyClaim": function_provisioned_claim,
+                "provisionedConcurrencyNotCoveredByReserved": uncovered,
+                "provisionedConfigurations": config_records,
+            }
+        )
+
+    return {
+        "functions": records,
+        "functionCount": len(records),
+        "totalReservedConcurrency": total_reserved,
+        "totalProvisionedConcurrency": total_provisioned,
+        "provisionedConcurrencyNotCoveredByReserved": provisioned_not_covered,
+    }
 
 
 def collector_provenance(require_clean: bool) -> dict[str, Any]:
@@ -562,6 +720,7 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
     rds_instances = cli.run_json("rds", "describe-db-instances")
     rds_snapshots = cli.run_json("rds", "describe-db-snapshots", "--snapshot-type", "manual")
     lambda_settings = cli.run_json("lambda", "get-account-settings")
+    lambda_allocations = collect_lambda_concurrency_allocations(cli)
 
     rds_instance_list = rds_instances.get("DBInstances") or []
     rds_committed_storage = sum(
@@ -596,6 +755,7 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
             "rdsManualSnapshots": len(rds_snapshots.get("DBSnapshots") or []),
         },
         "lambdaAccountSettings": lambda_settings,
+        "lambdaConcurrencyAllocations": lambda_allocations,
     }
 
 
