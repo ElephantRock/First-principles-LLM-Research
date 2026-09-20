@@ -137,9 +137,11 @@ If the sensitive-build implementation requires a direct KMS endpoint, add:
 --require-kms-interface-endpoint
 ```
 
-The collector has an explicit read-only AWS-operation allowlist. It gathers account identity, account-applied adjustable quotas, current regional consumption, exact RDS orderability/capability, regional VPC endpoint-service availability, Lambda account concurrency and existing reserved/provisioned allocations, and the AZ/topology information needed by the reviewed plan. It performs no create/update/delete operation.
+The collector has an explicit read-only AWS-operation allowlist. It gathers account identity, account-applied adjustable quotas, recent Fargate/EC2 vCPU consumption from CloudWatch `AWS/Usage`, current regional resource consumption, exact RDS orderability/capability, regional VPC endpoint-service availability, Lambda account concurrency and existing reserved/provisioned allocations, and the AZ/topology information needed by the reviewed plan. It performs no create/update/delete operation.
 
 For adjustable account quotas that can stop provisioning, the collector requires an account-applied value and refuses to substitute the provider default when Service Quotas does not expose one. Non-adjustable hard limits already frozen in P0 are evaluated as provider constraints against the reviewed topology instead of being misrepresented as account-applied values.
+
+Fargate and Standard On-Demand EC2 admission is based on **remaining headroom**, not merely the nominal applied quota. The collector reads CloudWatch `AWS/Usage` `ResourceCount` for the quota-corresponding `vCPU` resource and retains the complete recent measurement window in controlled evidence.
 
 ECS Express capability is checked by a real read-only `DescribeExpressGatewayService` call against a deliberately nonexistent service ARN. A recognized service/cluster-not-found response proves that the regional API understands the operation; a local CLI command model alone is not accepted as regional evidence.
 
@@ -148,6 +150,7 @@ The collector records:
 - `evidenceSource=fixture` or `evidenceSource=live-aws`;
 - the committed collector revision and script SHA-256;
 - AWS CLI v2 version, resolved executable path, and executable SHA-256 for live collection;
+- the recent Fargate On-Demand and EC2 Standard On-Demand vCPU usage windows used in free-capacity calculations;
 - every currently enumerated Lambda function's reserved concurrency plus each provisioned-concurrency configuration, using the maximum of requested/allocated/available values as the conservative claim while a configuration may be converging;
 - the exact incident-database user and account/region-bound `rds-db:connect` ARN and policy templates with only the future DBI resource ID left as a placeholder;
 - a SHA-256 companion for the complete controlled report.
@@ -165,8 +168,8 @@ The report must be green at minimum for the frozen P0 thresholds and the explici
 | Surface | Admission requirement |
 |---|---|
 | Region | `eu-west-1` enabled |
-| Fargate | account-applied On-Demand vCPU quota >= 6 |
-| EC2 worker | account-applied Standard On-Demand vCPU quota >= 4; `m7i.xlarge` offered in at least one selected RDS-capable AZ |
+| Fargate | account-applied On-Demand vCPU quota minus recent maximum observed `AWS/Usage` On-Demand Fargate vCPU consumption leaves **>=6 free vCPU** |
+| EC2 worker | account-applied Standard On-Demand vCPU quota minus recent maximum observed `AWS/Usage` Standard On-Demand EC2 vCPU consumption leaves **>=4 free vCPU**; `m7i.xlarge` is offered in at least one selected RDS-capable AZ |
 | RDS exact selection | PostgreSQL 18.6 + `db.m8gd.large` + `gp3` orderable; VPC, encryption, storage autoscaling and IAM DB authentication supported; 20 GiB initial / >=100 GiB max support |
 | RDS AZ topology | at least two enabled AZs support the exact RDS configuration; one of the selected AZs also offers `m7i.xlarge` |
 | RDS capacity | >=2 DB-instance slots and >=200 GiB headroom after existing instances' configured autoscaling ceilings |
@@ -188,7 +191,52 @@ Any failed frozen minimum is a hard provisioning stop. A normal adjustable quota
 
 ---
 
-## 6. Lambda concurrency evidence boundary
+## 6. Compute-vCPU headroom evidence boundary
+
+The P0 minima of 6 Fargate On-Demand vCPU and 4 Standard On-Demand EC2 vCPU are capacity minima for this production slice. A nominal account quota at exactly those values is insufficient if another workload is already consuming the quota.
+
+AWS publishes quota-corresponding `ResourceCount` usage metrics in the `AWS/Usage` namespace. For this admission report the collector reads:
+
+```text
+Fargate:
+  Service = Fargate
+  Type = Resource
+  Resource = vCPU
+  Class = Standard/OnDemand
+
+EC2:
+  Service = EC2
+  Type = Resource
+  Resource = vCPU
+  Class = Standard/OnDemand
+```
+
+The collector retains a 15-minute read-only window at one-minute resolution and uses the window's `Maximum` value. The calculations are:
+
+```text
+free Fargate On-Demand vCPU
+= applied Fargate On-Demand vCPU quota
+- recent maximum observed Fargate On-Demand vCPU usage
+
+free Standard On-Demand EC2 vCPU
+= applied Standard On-Demand EC2 vCPU quota
+- recent maximum observed Standard On-Demand EC2 vCPU usage
+```
+
+Admission requires:
+
+```text
+free Fargate On-Demand vCPU >= 6
+free Standard On-Demand EC2 vCPU >= 4
+```
+
+A 15-minute maximum is deliberately conservative relative to a single instantaneous sample: recently released capacity is not immediately assumed free for the gate. If AWS returns an empty usage window, the report records that fact explicitly and treats it as zero observed usage; the retained raw observation makes that interpretation reviewable rather than silently synthesizing a usage value.
+
+This evidence is still a point-in-time admission observation, not a reservation of quota. A later account-state change can consume headroom, so provisioning/release operations remain responsible for ordinary provider errors and must not reinterpret them as learner failures.
+
+---
+
+## 7. Lambda concurrency evidence boundary
 
 R19 requires the first P1 report to consider existing **reserved and provisioned** concurrency allocations, not merely the nominal Regional concurrency limit.
 
@@ -224,7 +272,7 @@ where six is the number of one-unit protected reservations frozen by the correct
 
 ---
 
-## 7. DynamoDB on-demand boundary
+## 8. DynamoDB on-demand boundary
 
 The initial protected release-control tables remain DynamoDB `PAY_PER_REQUEST`. The P0 record captured AWS's initial 40,000 read-request-unit and 40,000 write-request-unit per-table on-demand envelope.
 
@@ -232,7 +280,7 @@ AWS does not apply an account-level read/write throughput quota to on-demand tab
 
 ---
 
-## 8. Evidence handling
+## 9. Evidence handling
 
 The complete admission JSON contains AWS account identity and current infrastructure inventory. It is controlled operational evidence and must not be blindly committed to this public repository.
 
@@ -242,7 +290,7 @@ A green fixture run or repository CI run proves only collector behavior. The liv
 
 ---
 
-## 9. What remains after pre-create admission
+## 10. What remains after pre-create admission
 
 A green live no-create report is one required input to the next P1 implementation slice; it does not independently authorize provisioning and does not complete P1. Subsequent evidence must include, at minimum:
 
@@ -261,7 +309,7 @@ Only after those requirements and the governing P1 acceptance evidence are satis
 
 ---
 
-## 10. Current state
+## 11. Current state
 
 ```text
 P0: CLOSED and merged at fc46a2843ac79cef23b82b08cc08dba5a1a1b095
