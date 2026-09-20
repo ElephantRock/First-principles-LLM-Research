@@ -19,6 +19,22 @@ def quota(name: str, value: float, source: str = "applied") -> dict[str, object]
     return {"QuotaName": name, "Value": value, "fpllmValueSource": source}
 
 
+def usage(maximum: float) -> dict[str, object]:
+    return {
+        "namespace": "AWS/Usage",
+        "metricName": "ResourceCount",
+        "dimensions": {},
+        "windowStart": "2026-09-20T21:00:00Z",
+        "windowEnd": "2026-09-20T21:15:00Z",
+        "periodSeconds": 60,
+        "statistic": "Maximum",
+        "datapointCount": 1 if maximum else 0,
+        "maximumObservedVcpu": maximum,
+        "emptyWindowInterpretedAsZeroUsage": maximum == 0,
+        "datapoints": [] if maximum == 0 else [{"Maximum": maximum}],
+    }
+
+
 def passing_observation() -> dict[str, object]:
     return {
         "awsCliVersion": "aws-cli/2.36.49 Python/3.13 Linux/6.8",
@@ -62,6 +78,10 @@ def passing_observation() -> dict[str, object]:
             "cliCommandAvailable": True,
             "regionalApiRecognized": True,
             "probeOutcome": "expected-not-found",
+        },
+        "vcpuUsage": {
+            "fargateOnDemand": usage(0),
+            "ec2StandardOnDemand": usage(0),
         },
         "quotas": {
             "fargate": [quota("Fargate On-Demand vCPU resource count", 6)],
@@ -135,6 +155,29 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(summary["status"], "PASS")
         self.assertEqual(summary["selectedAvailabilityZones"], ["eu-west-1a", "eu-west-1b"])
         self.assertTrue(all(check.status == "PASS" for check in checks))
+
+    def test_fargate_quota_must_be_free_headroom_not_nominal_limit(self) -> None:
+        observed = passing_observation()
+        observed["vcpuUsage"]["fargateOnDemand"] = usage(1)
+        checks, summary = self.evaluate(observed)
+        self.assertEqual(summary["status"], "FAIL")
+        self.assertEqual(summary["fargateOnDemandVcpuHeadroom"], 5)
+        self.assertIn(
+            "quota.fargate-ondemand-vcpu-headroom",
+            {check.id for check in checks if check.status == "FAIL"},
+        )
+
+    def test_ec2_standard_quota_must_leave_four_free_vcpu(self) -> None:
+        observed = passing_observation()
+        observed["quotas"]["ec2"][0]["Value"] = 4
+        observed["vcpuUsage"]["ec2StandardOnDemand"] = usage(1)
+        checks, summary = self.evaluate(observed)
+        self.assertEqual(summary["status"], "FAIL")
+        self.assertEqual(summary["ec2StandardOnDemandVcpuHeadroom"], 3)
+        self.assertIn(
+            "quota.ec2-standard-ondemand-vcpu-headroom",
+            {check.id for check in checks if check.status == "FAIL"},
+        )
 
     def test_two_worker_azs_are_not_required(self) -> None:
         observed = passing_observation()
