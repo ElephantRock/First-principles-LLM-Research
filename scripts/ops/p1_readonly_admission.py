@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -29,6 +29,7 @@ MIN_SECURITY_GROUP_HEADROOM = 8
 MIN_ENI_HEADROOM = 32
 MIN_PRIVATE_CONTROL_USABLE_IPV4 = 32
 MIN_RDS_MANUAL_SNAPSHOT_HEADROOM = 2
+VCU_USAGE_WINDOW_MINUTES = 15
 
 # Frozen provider/hard-limit values recorded by the P0 decision chain.
 CODEBUILD_VPC_SECURITY_GROUP_LIMIT = 5
@@ -65,6 +66,7 @@ READ_ONLY_AWS_OPERATIONS = {
     ("lambda", "list-provisioned-concurrency-configs"),
     ("dynamodb", "list-tables"),
     ("ecs", "describe-express-gateway-service"),
+    ("cloudwatch", "get-metric-statistics"),
 }
 
 
@@ -245,6 +247,7 @@ def evaluate(
     region = observed.get("region") or {}
     quotas = observed.get("quotas") or {}
     usage = observed.get("usage") or {}
+    vcpu_usage = observed.get("vcpuUsage") or {}
     lambda_settings = observed.get("lambdaAccountSettings") or {}
     lambda_allocations = observed.get("lambdaConcurrencyAllocations") or {}
     enabled_azs = set(observed.get("enabledAvailabilityZones") or [])
@@ -277,10 +280,38 @@ def evaluate(
         return quota_value(quotas[service], *names, require_applied=True)
 
     fargate = applied("fargate", "Fargate On-Demand vCPU resource count")
-    add("quota.fargate-ondemand-vcpu", fargate >= 6, fargate, ">= 6 applied vCPU", "Frozen Fargate admission minimum.")
+    fargate_usage = (vcpu_usage.get("fargateOnDemand") or {}).get("maximumObservedVcpu")
+    fargate_headroom = (
+        fargate - float(fargate_usage) if isinstance(fargate_usage, (int, float)) else None
+    )
+    add(
+        "quota.fargate-ondemand-vcpu-headroom",
+        fargate_headroom is not None and fargate_headroom >= 6,
+        {
+            "appliedQuotaVcpu": fargate,
+            "recentMaximumUsageVcpu": fargate_usage,
+            "headroomVcpu": fargate_headroom,
+            "usageEvidence": vcpu_usage.get("fargateOnDemand"),
+        },
+        ">= 6 free vCPU after existing Fargate On-Demand usage",
+        "The frozen six-vCPU admission minimum is required as remaining regional headroom, not merely as a nominal quota value.",
+    )
 
     ec2 = applied("ec2", "Running On-Demand Standard")
-    add("quota.ec2-standard-ondemand-vcpu", ec2 >= 4, ec2, ">= 4 applied vCPU", "One m7i.xlarge requires four Standard On-Demand vCPUs.")
+    ec2_usage = (vcpu_usage.get("ec2StandardOnDemand") or {}).get("maximumObservedVcpu")
+    ec2_headroom = ec2 - float(ec2_usage) if isinstance(ec2_usage, (int, float)) else None
+    add(
+        "quota.ec2-standard-ondemand-vcpu-headroom",
+        ec2_headroom is not None and ec2_headroom >= 4,
+        {
+            "appliedQuotaVcpu": ec2,
+            "recentMaximumUsageVcpu": ec2_usage,
+            "headroomVcpu": ec2_headroom,
+            "usageEvidence": vcpu_usage.get("ec2StandardOnDemand"),
+        },
+        ">= 4 free Standard On-Demand vCPU after existing usage",
+        "One m7i.xlarge worker requires four remaining Standard On-Demand vCPUs.",
+    )
 
     alb_quota = applied("elasticloadbalancing", "Application Load Balancers per Region")
     alb_count = int(usage.get("applicationLoadBalancers", -1))
@@ -481,6 +512,8 @@ def evaluate(
         "interfaceEndpointCountRequired": interface_required,
         "protectedLambdaReservedConcurrencyUnits": PROTECTED_LAMBDA_COUNT,
         "lambdaEffectiveUnreservedAfterExistingProvisionedConcurrency": effective_unreserved_after_existing_pc,
+        "fargateOnDemandVcpuHeadroom": fargate_headroom,
+        "ec2StandardOnDemandVcpuHeadroom": ec2_headroom,
     }
     return checks, summary
 
@@ -554,6 +587,63 @@ class AwsCli:
         if any(marker in lowered for marker in ("unknownoperation", "unsupportedoperation", "not supported in this region")):
             return {"cliCommandAvailable": True, "regionalApiRecognized": False, "probeOutcome": "regional-api-unsupported"}
         raise AdmissionError(f"ECS Express regional read probe returned an unclassified error: {combined[-1200:]}")
+
+
+def collect_recent_vcpu_usage(cli: AwsCli, service: str, resource_class: str) -> dict[str, Any]:
+    end = datetime.now(timezone.utc).replace(microsecond=0)
+    start = end - timedelta(minutes=VCU_USAGE_WINDOW_MINUTES)
+    dimensions = [
+        f"Name=Service,Value={service}",
+        "Name=Type,Value=Resource",
+        "Name=Resource,Value=vCPU",
+        f"Name=Class,Value={resource_class}",
+    ]
+    doc = cli.run_json(
+        "cloudwatch",
+        "get-metric-statistics",
+        "--namespace",
+        "AWS/Usage",
+        "--metric-name",
+        "ResourceCount",
+        "--dimensions",
+        *dimensions,
+        "--start-time",
+        start.isoformat().replace("+00:00", "Z"),
+        "--end-time",
+        end.isoformat().replace("+00:00", "Z"),
+        "--period",
+        "60",
+        "--statistics",
+        "Maximum",
+    )
+    datapoints = doc.get("Datapoints")
+    if not isinstance(datapoints, list):
+        raise AdmissionError(f"CloudWatch AWS/Usage response missing Datapoints for {service}/{resource_class}")
+    values: list[float] = []
+    for point in datapoints:
+        value = point.get("Maximum")
+        if not isinstance(value, (int, float)) or float(value) < 0:
+            raise AdmissionError(f"invalid AWS/Usage ResourceCount datapoint for {service}/{resource_class}: {point!r}")
+        values.append(float(value))
+    maximum = max(values) if values else 0.0
+    return {
+        "namespace": "AWS/Usage",
+        "metricName": "ResourceCount",
+        "dimensions": {
+            "Service": service,
+            "Type": "Resource",
+            "Resource": "vCPU",
+            "Class": resource_class,
+        },
+        "windowStart": start.isoformat().replace("+00:00", "Z"),
+        "windowEnd": end.isoformat().replace("+00:00", "Z"),
+        "periodSeconds": 60,
+        "statistic": "Maximum",
+        "datapointCount": len(datapoints),
+        "maximumObservedVcpu": maximum,
+        "emptyWindowInterpretedAsZeroUsage": len(datapoints) == 0,
+        "datapoints": datapoints,
+    }
 
 
 def service_quotas(cli: AwsCli, service_code: str) -> list[dict[str, Any]]:
@@ -710,6 +800,10 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
     endpoint_doc = cli.run_json("ec2", "describe-vpc-endpoint-services", "--service-names", *endpoint_names)
 
     express_probe = cli.probe_express_gateway_service(account)
+    vcpu_usage = {
+        "fargateOnDemand": collect_recent_vcpu_usage(cli, "Fargate", "Standard/OnDemand"),
+        "ec2StandardOnDemand": collect_recent_vcpu_usage(cli, "EC2", "Standard/OnDemand"),
+    }
     vpcs = cli.run_json("ec2", "describe-vpcs")
     enis = cli.run_json("ec2", "describe-network-interfaces")
     sgs = cli.run_json("ec2", "describe-security-groups")
@@ -738,6 +832,7 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
         "rdsOrderableOptions": rds_doc.get("OrderableDBInstanceOptions") or [],
         "endpointServices": endpoint_doc.get("ServiceNames") or [],
         "ecsExpress": express_probe,
+        "vcpuUsage": vcpu_usage,
         "quotas": {
             code: service_quotas(cli, code)
             for code in ("fargate", "ec2", "rds", "elasticloadbalancing", "vpc", "codebuild", "dynamodb")
