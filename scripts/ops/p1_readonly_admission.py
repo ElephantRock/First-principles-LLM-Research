@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
+import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,17 +24,37 @@ PLANNED_SUBNET_CIDRS = (
     "10.42.32.0/24",
     "10.42.33.0/24",
 )
+PLANNED_PUBLIC_CIDRS = ("10.42.0.0/24", "10.42.1.0/24")
 PLANNED_PRIVATE_CONTROL_CIDRS = ("10.42.16.0/24", "10.42.17.0/24")
+PLANNED_PRIVATE_DB_CIDRS = ("10.42.32.0/24", "10.42.33.0/24")
 PROTECTED_LAMBDA_COUNT = 6
 INCIDENT_MEDIATOR_MAX_DB_SESSIONS = 1
+INCIDENT_DB_USER = "fpllm_incident_fence"
 MIN_PRIVATE_SUBNET_USABLE_IPV4 = 32
 MIN_SECURITY_GROUP_HEADROOM = 8
 MIN_ENI_HEADROOM = 32
 MIN_RDS_MANUAL_SNAPSHOT_HEADROOM = 2
+MIN_DYNAMODB_TABLE_THROUGHPUT = 100
 
-# Every network/API request made by the collector itself must be present here.
-# Local AWS CLI model inspection (--generate-cli-skeleton) is intentionally not
-# included because it does not send an AWS request.
+# Frozen/provider hard limits whose planned consumption can be proved without an
+# account mutation. Account-adjustable values are still read live below.
+ECS_SERVICES_PER_CLUSTER_HARD_LIMIT = 5000
+ECS_TASKS_PER_SERVICE_HARD_LIMIT = 5000
+ECS_AWSVPC_SECURITY_GROUPS_HARD_LIMIT = 5
+ECS_AWSVPC_SUBNETS_HARD_LIMIT = 16
+FARGATE_SUSTAINED_LAUNCH_RATE = 20
+LAMBDA_VPC_SECURITY_GROUPS_HARD_LIMIT = 5
+LAMBDA_VPC_SUBNETS_HARD_LIMIT = 16
+
+PLANNED_WEB_SERVICES = 1
+PLANNED_WEB_MAX_TASKS = 2
+PLANNED_WEB_SECURITY_GROUPS = 1
+PLANNED_WEB_SUBNETS = 2
+PLANNED_FARGATE_PEAK_LAUNCHES_PER_SECOND = 3
+PLANNED_INCIDENT_MEDIATOR_SECURITY_GROUPS = 1
+PLANNED_INCIDENT_MEDIATOR_SUBNETS = 2
+
+# Every AWS network/API request made by this collector must be listed here.
 READ_ONLY_AWS_OPERATIONS = {
     ("sts", "get-caller-identity"),
     ("ec2", "describe-regions"),
@@ -51,7 +74,7 @@ READ_ONLY_AWS_OPERATIONS = {
     ("codebuild", "list-projects"),
     ("lambda", "get-account-settings"),
     ("dynamodb", "list-tables"),
-    ("ecs", "list-clusters"),
+    ("ecs", "describe-express-gateway-service"),
 }
 
 
@@ -81,11 +104,23 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def normalize_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
 
-def quota_value(quotas: Iterable[dict[str, Any]], *names_or_substrings: str) -> float:
+def quota_entry(
+    quotas: Iterable[dict[str, Any]],
+    *names_or_substrings: str,
+    require_applied: bool = False,
+) -> dict[str, Any]:
     needles = tuple(normalize_name(item) for item in names_or_substrings)
     exact = [
         quota
@@ -104,12 +139,32 @@ def quota_value(quotas: Iterable[dict[str, Any]], *names_or_substrings: str) -> 
         raise AdmissionError(
             f"quota lookup ambiguous/missing for {names_or_substrings!r}: {names}"
         )
-    value = matches[0].get("Value")
+    match = matches[0]
+    value = match.get("Value")
     if not isinstance(value, (int, float)):
         raise AdmissionError(
-            f"quota value is not numeric for {matches[0].get('QuotaName')!r}: {value!r}"
+            f"quota value is not numeric for {match.get('QuotaName')!r}: {value!r}"
         )
-    return float(value)
+    if require_applied and match.get("fpllmValueSource") != "applied":
+        raise AdmissionError(
+            "account-applied quota is unavailable; refusing to substitute the AWS default "
+            f"for {match.get('QuotaName')!r}"
+        )
+    return match
+
+
+def quota_value(
+    quotas: Iterable[dict[str, Any]],
+    *names_or_substrings: str,
+    require_applied: bool = False,
+) -> float:
+    return float(
+        quota_entry(
+            quotas,
+            *names_or_substrings,
+            require_applied=require_applied,
+        )["Value"]
+    )
 
 
 def count_list(doc: dict[str, Any], key: str) -> int:
@@ -128,8 +183,6 @@ def usable_ipv4(cidr: str) -> int:
 
 
 def validate_topology(private_subnet_cidrs: list[str]) -> dict[str, int]:
-    if len(private_subnet_cidrs) < 2:
-        raise AdmissionError("at least two private application/control subnet CIDRs are required")
     if tuple(sorted(private_subnet_cidrs)) != tuple(sorted(PLANNED_PRIVATE_CONTROL_CIDRS)):
         raise AdmissionError(
             "private application/control CIDRs must match the reviewed P1 topology: "
@@ -149,6 +202,44 @@ def validate_topology(private_subnet_cidrs: list[str]) -> dict[str, int]:
     return {cidr: usable_ipv4(cidr) for cidr in private_subnet_cidrs}
 
 
+def rds_db_connect_resource_template(account: str) -> str:
+    if not re.fullmatch(r"\d{12}", account):
+        raise AdmissionError(f"AWS account ID is not a 12-digit value: {account!r}")
+    return (
+        f"arn:aws:rds-db:{REGION}:{account}:dbuser:"
+        f"<DBI_RESOURCE_ID>/{INCIDENT_DB_USER}"
+    )
+
+
+def planned_topology(account: str) -> dict[str, Any]:
+    return {
+        "vpcCidr": VPC_CIDR,
+        "publicSubnetCidrs": list(PLANNED_PUBLIC_CIDRS),
+        "privateApplicationControlSubnetCidrs": list(PLANNED_PRIVATE_CONTROL_CIDRS),
+        "privateDbSubnetCidrs": list(PLANNED_PRIVATE_DB_CIDRS),
+        "natGatewaySelected": False,
+        "web": {
+            "services": PLANNED_WEB_SERVICES,
+            "maxTasks": PLANNED_WEB_MAX_TASKS,
+            "securityGroups": PLANNED_WEB_SECURITY_GROUPS,
+            "subnets": PLANNED_WEB_SUBNETS,
+            "plannedPeakLaunchesPerSecond": PLANNED_FARGATE_PEAK_LAUNCHES_PER_SECOND,
+        },
+        "incidentMediator": {
+            "vpcAttached": True,
+            "subnets": PLANNED_INCIDENT_MEDIATOR_SUBNETS,
+            "securityGroups": PLANNED_INCIDENT_MEDIATOR_SECURITY_GROUPS,
+            "rdsPort": 5432,
+            "internetNatEgress": False,
+            "dynamodbGatewayEndpoint": True,
+            "rdsIamDatabaseAuthentication": True,
+            "dbUser": INCIDENT_DB_USER,
+            "maxConcurrentDbSessions": INCIDENT_MEDIATOR_MAX_DB_SESSIONS,
+            "rdsDbConnectResourceTemplate": rds_db_connect_resource_template(account),
+        },
+    }
+
+
 def evaluate(
     observed: dict[str, Any],
     private_subnet_cidrs: list[str],
@@ -157,6 +248,11 @@ def evaluate(
     subnet_capacity = validate_topology(private_subnet_cidrs)
 
     identity = observed.get("identity") or {}
+    account = identity.get("Account")
+    if not isinstance(account, str):
+        raise AdmissionError("caller identity is missing an AWS account ID")
+    topology = planned_topology(account)
+
     region = observed.get("region") or {}
     quotas = observed.get("quotas") or {}
     usage = observed.get("usage") or {}
@@ -179,13 +275,12 @@ def evaluate(
             )
         )
 
-    account = identity.get("Account")
     add(
         "identity.account",
-        isinstance(account, str) and bool(account),
+        bool(re.fullmatch(r"\d{12}", account)),
         account,
-        "non-empty AWS account ID",
-        "Caller identity must be attributable.",
+        "12-digit AWS account ID",
+        "Caller identity must be attributable and usable in exact IAM resource construction.",
     )
 
     region_name = region.get("RegionName")
@@ -199,27 +294,33 @@ def evaluate(
     )
 
     fargate_quota = quota_value(
-        quotas["fargate"], "Fargate On-Demand vCPU resource count"
+        quotas["fargate"],
+        "Fargate On-Demand vCPU resource count",
+        require_applied=True,
     )
     add(
         "quota.fargate-ondemand-vcpu",
         fargate_quota >= 6,
         fargate_quota,
-        ">= 6 vCPU",
-        "Frozen web/migration/canary applied-quota minimum.",
+        ">= 6 applied vCPU",
+        "Frozen web/migration/canary account-applied quota minimum.",
     )
 
-    ec2_quota = quota_value(quotas["ec2"], "Running On-Demand Standard")
+    ec2_quota = quota_value(
+        quotas["ec2"], "Running On-Demand Standard", require_applied=True
+    )
     add(
         "quota.ec2-standard-ondemand-vcpu",
         ec2_quota >= 4,
         ec2_quota,
-        ">= 4 vCPU",
+        ">= 4 applied vCPU",
         "One m7i.xlarge worker requires four Standard On-Demand vCPUs.",
     )
 
     alb_quota = quota_value(
-        quotas["elasticloadbalancing"], "Application Load Balancers per Region"
+        quotas["elasticloadbalancing"],
+        "Application Load Balancers per Region",
+        require_applied=True,
     )
     alb_count = int(usage.get("applicationLoadBalancers", -1))
     add(
@@ -230,7 +331,7 @@ def evaluate(
         "ECS Express requires one internet-facing ALB in the frozen topology.",
     )
 
-    vpc_quota = quota_value(quotas["vpc"], "VPCs per Region")
+    vpc_quota = quota_value(quotas["vpc"], "VPCs per Region", require_applied=True)
     vpc_count = int(usage.get("vpcs", -1))
     add(
         "quota.vpc-headroom",
@@ -240,16 +341,20 @@ def evaluate(
         "P1 provisions one production VPC.",
     )
 
-    subnet_quota = quota_value(quotas["vpc"], "Subnets per VPC")
+    subnet_quota = quota_value(
+        quotas["vpc"], "Subnets per VPC", require_applied=True
+    )
     add(
         "quota.subnets-per-vpc",
         subnet_quota >= len(PLANNED_SUBNET_CIDRS),
         subnet_quota,
-        f">= {len(PLANNED_SUBNET_CIDRS)}",
+        f">= {len(PLANNED_SUBNET_CIDRS)} applied",
         "The reviewed topology uses two public, two private app/control and two private DB subnets.",
     )
 
-    sg_quota = quota_value(quotas["vpc"], "VPC security groups per Region")
+    sg_quota = quota_value(
+        quotas["vpc"], "VPC security groups per Region", require_applied=True
+    )
     sg_count = int(usage.get("securityGroups", -1))
     add(
         "quota.security-group-headroom",
@@ -259,7 +364,9 @@ def evaluate(
         "Conservative P1 margin for distinct web/worker/RDS/build/incident boundaries.",
     )
 
-    eni_quota = quota_value(quotas["vpc"], "Network interfaces per Region")
+    eni_quota = quota_value(
+        quotas["vpc"], "Network interfaces per Region", require_applied=True
+    )
     eni_count = int(usage.get("networkInterfaces", -1))
     add(
         "quota.network-interface-headroom",
@@ -269,18 +376,20 @@ def evaluate(
         "Conservative pre-create margin for Fargate, VPC Lambda, CodeBuild, RDS and interface endpoints.",
     )
 
-    endpoint_quota = quota_value(quotas["vpc"], "Interface VPC endpoints per VPC")
+    interface_endpoint_quota = quota_value(
+        quotas["vpc"], "Interface VPC endpoints per VPC", require_applied=True
+    )
     required_interface_endpoints = 4 if require_kms_endpoint else 3
     add(
         "quota.interface-vpc-endpoints",
-        endpoint_quota >= required_interface_endpoints,
-        endpoint_quota,
-        f">= {required_interface_endpoints}",
+        interface_endpoint_quota >= required_interface_endpoints,
+        interface_endpoint_quota,
+        f">= {required_interface_endpoints} applied per VPC",
         "Sensitive build requires ECR API, ECR DKR and Logs; KMS is optional only when proven necessary.",
     )
 
     gateway_endpoint_quota = quota_value(
-        quotas["vpc"], "Gateway VPC endpoints per Region"
+        quotas["vpc"], "Gateway VPC endpoints per Region", require_applied=True
     )
     gateway_endpoint_count = int(usage.get("gatewayVpcEndpoints", -1))
     add(
@@ -297,17 +406,21 @@ def evaluate(
     )
 
     codebuild_concurrency = quota_value(
-        quotas["codebuild"], "Concurrently running builds for Linux/Large"
+        quotas["codebuild"],
+        "Concurrently running builds for Linux/Large",
+        require_applied=True,
     )
     add(
         "quota.codebuild-linux-large-concurrency",
         codebuild_concurrency >= 1,
         codebuild_concurrency,
-        ">= 1",
-        "Three protected projects are globally serialized to one running Linux/Large build.",
+        ">= 1 applied",
+        "The existence of a usable applied Linux/Large slot is the no-create account capability check for BUILD_GENERAL1_LARGE.",
     )
 
-    codebuild_projects_quota = quota_value(quotas["codebuild"], "Build projects")
+    codebuild_projects_quota = quota_value(
+        quotas["codebuild"], "Build projects", require_applied=True
+    )
     project_count = int(usage.get("codebuildProjects", -1))
     add(
         "quota.codebuild-project-headroom",
@@ -328,7 +441,7 @@ def evaluate(
         "quota.codebuild-vpc-security-groups",
         codebuild_sg_limit >= 1,
         codebuild_sg_limit,
-        ">= 1",
+        ">= 1 hard/default capability",
         "The sensitive builder needs one bounded security-group attachment.",
     )
 
@@ -339,7 +452,7 @@ def evaluate(
         "quota.codebuild-vpc-subnets",
         codebuild_subnet_limit >= len(PLANNED_PRIVATE_CONTROL_CIDRS),
         codebuild_subnet_limit,
-        f">= {len(PLANNED_PRIVATE_CONTROL_CIDRS)}",
+        f">= {len(PLANNED_PRIVATE_CONTROL_CIDRS)} hard/default capability",
         "The sensitive builder is planned across the two private app/control subnets.",
     )
 
@@ -363,7 +476,10 @@ def evaluate(
     )
 
     ddb_table_quota = quota_value(
-        quotas["dynamodb"], "Maximum number of tables", "Tables per Region"
+        quotas["dynamodb"],
+        "Maximum number of tables",
+        "Tables per Region",
+        require_applied=True,
     )
     ddb_count = int(usage.get("dynamodbTables", -1))
     add(
@@ -378,7 +494,28 @@ def evaluate(
         "Protected release-control uses at most two on-demand tables.",
     )
 
-    rds_db_quota = quota_value(quotas["rds"], "DB instances")
+    ddb_read_quota = quota_value(
+        quotas["dynamodb"],
+        "Table-level read throughput limit",
+        require_applied=True,
+    )
+    ddb_write_quota = quota_value(
+        quotas["dynamodb"],
+        "Table-level write throughput limit",
+        require_applied=True,
+    )
+    add(
+        "quota.dynamodb-table-throughput",
+        ddb_read_quota >= MIN_DYNAMODB_TABLE_THROUGHPUT
+        and ddb_write_quota >= MIN_DYNAMODB_TABLE_THROUGHPUT,
+        {"readRequestUnits": ddb_read_quota, "writeRequestUnits": ddb_write_quota},
+        f">= {MIN_DYNAMODB_TABLE_THROUGHPUT} read and write request units/sec applied per table",
+        "This conservative P1 floor is well above the frozen human-paced release-control envelope and detects an anomalously low account quota before table creation.",
+    )
+
+    rds_db_quota = quota_value(
+        quotas["rds"], "DB instances", require_applied=True
+    )
     rds_count = int(usage.get("rdsInstances", -1))
     add(
         "quota.rds-instance-headroom",
@@ -388,21 +525,26 @@ def evaluate(
         "Production and restore-drill target may coexist.",
     )
 
-    rds_storage_quota = quota_value(quotas["rds"], "Total storage for all DB instances")
-    current_rds_storage = int(usage.get("rdsAllocatedStorageGiB", -1))
+    rds_storage_quota = quota_value(
+        quotas["rds"], "Total storage for all DB instances", require_applied=True
+    )
+    current_rds_committed_storage = int(usage.get("rdsCommittedStorageGiB", -1))
     add(
         "quota.rds-storage-headroom",
-        current_rds_storage >= 0 and rds_storage_quota - current_rds_storage >= 200,
+        current_rds_committed_storage >= 0
+        and rds_storage_quota - current_rds_committed_storage >= 200,
         {
             "quotaGiB": rds_storage_quota,
-            "currentAllocatedGiB": current_rds_storage,
-            "headroomGiB": rds_storage_quota - current_rds_storage,
+            "existingCommittedGiB": current_rds_committed_storage,
+            "headroomGiB": rds_storage_quota - current_rds_committed_storage,
         },
-        ">= 200 GiB headroom",
-        "Production and restore target may each reach the 100 GiB autoscaling ceiling.",
+        ">= 200 GiB headroom after existing instances' configured autoscaling ceilings",
+        "Production and restore target may each reach the frozen 100 GiB autoscaling ceiling.",
     )
 
-    rds_snapshot_quota = quota_value(quotas["rds"], "Manual DB instance snapshots")
+    rds_snapshot_quota = quota_value(
+        quotas["rds"], "Manual DB instance snapshots", require_applied=True
+    )
     rds_snapshot_count = int(usage.get("rdsManualSnapshots", -1))
     add(
         "quota.rds-manual-snapshot-headroom",
@@ -422,7 +564,7 @@ def evaluate(
         "quota.rds-subnets-per-db-subnet-group",
         rds_subnet_limit >= 2,
         rds_subnet_limit,
-        ">= 2",
+        ">= 2 hard/default capability",
         "The selected RDS topology requires private DB subnets in at least two Availability Zones.",
     )
 
@@ -483,11 +625,29 @@ def evaluate(
     express = observed.get("ecsExpress") or {}
     add(
         "availability.ecs-express",
-        express.get("apiModelAvailable") is True
-        and express.get("regionalEndpointReachable") is True,
+        express.get("cliCommandAvailable") is True
+        and express.get("regionalApiRecognized") is True,
         express,
-        {"apiModelAvailable": True, "regionalEndpointReachable": True},
-        "No-create probe requires the Express CLI/API model and reachable ECS regional endpoint.",
+        {"cliCommandAvailable": True, "regionalApiRecognized": True},
+        "A real read-only DescribeExpressGatewayService request must reach a regional API that recognizes Express; a local CLI model alone is insufficient.",
+    )
+
+    add(
+        "topology.ecs-express-hard-limits",
+        PLANNED_WEB_SERVICES <= ECS_SERVICES_PER_CLUSTER_HARD_LIMIT
+        and PLANNED_WEB_MAX_TASKS <= ECS_TASKS_PER_SERVICE_HARD_LIMIT
+        and PLANNED_WEB_SECURITY_GROUPS <= ECS_AWSVPC_SECURITY_GROUPS_HARD_LIMIT
+        and PLANNED_WEB_SUBNETS <= ECS_AWSVPC_SUBNETS_HARD_LIMIT
+        and PLANNED_FARGATE_PEAK_LAUNCHES_PER_SECOND <= FARGATE_SUSTAINED_LAUNCH_RATE,
+        topology["web"],
+        {
+            "servicesPerClusterMax": ECS_SERVICES_PER_CLUSTER_HARD_LIMIT,
+            "tasksPerServiceMax": ECS_TASKS_PER_SERVICE_HARD_LIMIT,
+            "awsvpcSecurityGroupsMax": ECS_AWSVPC_SECURITY_GROUPS_HARD_LIMIT,
+            "awsvpcSubnetsMax": ECS_AWSVPC_SUBNETS_HARD_LIMIT,
+            "fargateSustainedLaunchRate": FARGATE_SUSTAINED_LAUNCH_RATE,
+        },
+        "Frozen web consumption remains below the provider hard limits recorded in P0.",
     )
 
     required_endpoint_services = {
@@ -519,12 +679,50 @@ def evaluate(
         "Conservative pre-create margin for interface endpoints, CodeBuild and VPC Lambda ENIs.",
     )
 
-    planned_incident_sessions = observed.get("plannedIncidentMediatorMaxDbSessions")
+    incident = topology["incidentMediator"]
+    add(
+        "topology.incident-mediator-vpc-attachment",
+        incident["vpcAttached"] is True
+        and incident["subnets"] <= LAMBDA_VPC_SUBNETS_HARD_LIMIT
+        and incident["securityGroups"] <= LAMBDA_VPC_SECURITY_GROUPS_HARD_LIMIT
+        and incident["rdsPort"] == 5432
+        and incident["internetNatEgress"] is False
+        and incident["dynamodbGatewayEndpoint"] is True,
+        incident,
+        {
+            "vpcAttached": True,
+            "subnetsMax": LAMBDA_VPC_SUBNETS_HARD_LIMIT,
+            "securityGroupsMax": LAMBDA_VPC_SECURITY_GROUPS_HARD_LIMIT,
+            "rdsPort": 5432,
+            "internetNatEgress": False,
+            "dynamodbGatewayEndpoint": True,
+        },
+        "R31's mediator topology is mechanically representable within Lambda VPC configuration limits.",
+    )
+    add(
+        "topology.rds-iam-database-auth-plan",
+        incident["rdsIamDatabaseAuthentication"] is True
+        and incident["dbUser"] == INCIDENT_DB_USER,
+        {
+            "enabledInPlan": incident["rdsIamDatabaseAuthentication"],
+            "dbUser": incident["dbUser"],
+        },
+        {"enabledInPlan": True, "dbUser": INCIDENT_DB_USER},
+        "The selected create-time RDS configuration enables IAM DB authentication for the exact fence-only database login; post-create evidence must prove the realized setting and grants.",
+    )
+    expected_resource_template = rds_db_connect_resource_template(account)
+    add(
+        "topology.rds-db-connect-resource-template",
+        incident["rdsDbConnectResourceTemplate"] == expected_resource_template,
+        incident["rdsDbConnectResourceTemplate"],
+        expected_resource_template,
+        "The pre-create report binds account, region and exact DB username in the rds-db:connect ARN shape; the created DBI resource ID must replace the single placeholder before the IAM policy is accepted.",
+    )
     add(
         "topology.rds-incident-connection-budget",
-        planned_incident_sessions == INCIDENT_MEDIATOR_MAX_DB_SESSIONS,
-        planned_incident_sessions,
-        f"exactly {INCIDENT_MEDIATOR_MAX_DB_SESSIONS} planned concurrent fpllm_incident_fence session",
+        incident["maxConcurrentDbSessions"] == INCIDENT_MEDIATOR_MAX_DB_SESSIONS,
+        incident["maxConcurrentDbSessions"],
+        f"exactly {INCIDENT_MEDIATOR_MAX_DB_SESSIONS} planned concurrent {INCIDENT_DB_USER} session",
         "Live RDS max_connections/headroom remains post-provision evidence before incident use.",
     )
 
@@ -547,7 +745,7 @@ class AwsCli:
         self.profile = profile
         self.region = region
 
-    def run_json(self, service: str, operation: str, *args: str) -> dict[str, Any]:
+    def _base_command(self, service: str, operation: str, *args: str) -> list[str]:
         if (service, operation) not in READ_ONLY_AWS_OPERATIONS:
             raise AdmissionError(
                 f"non-read-only AWS operation rejected: {service} {operation}"
@@ -562,10 +760,29 @@ class AwsCli:
             "--output",
             "json",
             "--no-cli-pager",
+            "--cli-connect-timeout",
+            "10",
+            "--cli-read-timeout",
+            "30",
         ]
         if self.profile:
             command.extend(["--profile", self.profile])
-        result = subprocess.run(command, capture_output=True, text=True)
+        return command
+
+    def _run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AdmissionError(f"command timed out: {command[:3]!r}") from exc
+
+    def run_json(self, service: str, operation: str, *args: str) -> dict[str, Any]:
+        command = self._base_command(service, operation, *args)
+        result = self._run(command)
         if result.returncode != 0:
             raise AdmissionError(
                 f"AWS read failed ({service} {operation}): {result.stderr.strip()}"
@@ -583,9 +800,7 @@ class AwsCli:
         return value
 
     def cli_version(self) -> str:
-        result = subprocess.run(
-            [self.binary, "--version"], capture_output=True, text=True
-        )
+        result = self._run([self.binary, "--version"])
         if result.returncode != 0:
             raise AdmissionError(f"cannot execute AWS CLI: {result.stderr.strip()}")
         version = (result.stdout or result.stderr).strip()
@@ -596,29 +811,95 @@ class AwsCli:
             )
         return version
 
-    def express_api_model_available(self) -> bool:
-        # --generate-cli-skeleton is a local model operation and sends no AWS request.
-        command = [
-            self.binary,
+    def executable_provenance(self) -> dict[str, str]:
+        resolved = shutil.which(self.binary)
+        if resolved is None:
+            raise AdmissionError(f"AWS CLI executable not found: {self.binary!r}")
+        path = Path(resolved).resolve()
+        if not path.is_file():
+            raise AdmissionError(f"AWS CLI executable is not a file: {path}")
+        return {
+            "resolvedPath": str(path),
+            "sha256": sha256_file(path),
+        }
+
+    def probe_express_gateway_service(self, account: str) -> dict[str, Any]:
+        service_arn = (
+            f"arn:aws:ecs:{self.region}:{account}:"
+            "service/default/fpllm-readonly-admission-probe-does-not-exist"
+        )
+        command = self._base_command(
             "ecs",
             "describe-express-gateway-service",
             "--service-arn",
-            f"arn:aws:ecs:{self.region}:000000000000:express-gateway-service/fpllm-readonly-probe",
-            "--generate-cli-skeleton",
-            "output",
-            "--region",
-            self.region,
-            "--no-cli-pager",
-        ]
-        if self.profile:
-            command.extend(["--profile", self.profile])
-        result = subprocess.run(command, capture_output=True, text=True)
-        return result.returncode == 0
+            service_arn,
+        )
+        result = self._run(command)
+        combined = f"{result.stdout}\n{result.stderr}".strip()
+        lowered = combined.lower()
+
+        if result.returncode == 0:
+            return {
+                "cliCommandAvailable": True,
+                "regionalApiRecognized": True,
+                "probeOutcome": "unexpected-existing-service-or-success",
+            }
+
+        if "invalid choice" in lowered or "unknown options" in lowered:
+            return {
+                "cliCommandAvailable": False,
+                "regionalApiRecognized": False,
+                "probeOutcome": "aws-cli-model-does-not-support-express",
+            }
+
+        recognized_not_found = any(
+            marker in lowered
+            for marker in (
+                "servicenotfoundexception",
+                "service not found",
+                "service was not found",
+                "could not find service",
+            )
+        )
+        if recognized_not_found:
+            return {
+                "cliCommandAvailable": True,
+                "regionalApiRecognized": True,
+                "probeOutcome": "expected-nonexistent-service",
+            }
+
+        if "accessdenied" in lowered or "access denied" in lowered:
+            raise AdmissionError(
+                "read-only identity cannot call ecs:DescribeExpressGatewayService; "
+                "regional Express capability cannot be verified"
+            )
+
+        if (
+            "unknownoperation" in lowered
+            or "unsupportedoperation" in lowered
+            or "not supported in this region" in lowered
+        ):
+            return {
+                "cliCommandAvailable": True,
+                "regionalApiRecognized": False,
+                "probeOutcome": "regional-api-does-not-support-express",
+            }
+
+        excerpt = combined[-1200:]
+        raise AdmissionError(
+            "ECS Express regional read probe returned an unclassified error: "
+            f"{excerpt}"
+        )
 
 
 def service_quotas(cli: AwsCli, service_code: str) -> list[dict[str, Any]]:
     applied_doc = cli.run_json(
-        "service-quotas", "list-service-quotas", "--service-code", service_code
+        "service-quotas",
+        "list-service-quotas",
+        "--service-code",
+        service_code,
+        "--quota-applied-at-level",
+        "ACCOUNT",
     )
     default_doc = cli.run_json(
         "service-quotas",
@@ -631,8 +912,6 @@ def service_quotas(cli: AwsCli, service_code: str) -> list[dict[str, Any]]:
     if not isinstance(applied, list) or not isinstance(defaults, list):
         raise AdmissionError(f"missing service quotas for {service_code}")
 
-    # Applied/account-specific values override provider defaults by stable quota code.
-    # Defaults fill hard/default-only quota codes that have no applied-account entry.
     merged: dict[str, dict[str, Any]] = {}
     for quota in defaults:
         code = quota.get("QuotaCode") or f"default:{quota.get('QuotaName')}"
@@ -643,9 +922,67 @@ def service_quotas(cli: AwsCli, service_code: str) -> list[dict[str, Any]]:
     return list(merged.values())
 
 
+def collector_provenance(require_clean: bool) -> dict[str, Any]:
+    script = Path(__file__).resolve()
+    root = script.parents[2]
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        if require_clean:
+            raise AdmissionError(
+                "live evidence must be generated from a Git checkout with an attributable commit"
+            )
+        commit = None
+    else:
+        commit = result.stdout.strip()
+
+    relative_script = script.relative_to(root)
+    status = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--",
+            str(relative_script),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if status.returncode != 0:
+        if require_clean:
+            raise AdmissionError("cannot prove collector working-tree state")
+        clean = None
+    else:
+        clean = status.stdout.strip() == ""
+
+    if require_clean and not clean:
+        raise AdmissionError(
+            "live evidence collector differs from the committed Git revision"
+        )
+
+    return {
+        "gitCommit": commit,
+        "scriptPath": str(relative_script),
+        "scriptSha256": sha256_file(script),
+        "scriptWorkingTreeClean": clean,
+    }
+
+
 def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
     version = cli.cli_version()
+    cli_provenance = cli.executable_provenance()
     identity = cli.run_json("sts", "get-caller-identity")
+    account = identity.get("Account")
+    if not isinstance(account, str) or not re.fullmatch(r"\d{12}", account):
+        raise AdmissionError(f"invalid AWS account ID in caller identity: {account!r}")
 
     regions = cli.run_json(
         "ec2", "describe-regions", "--all-regions", "--region-names", REGION
@@ -703,8 +1040,7 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
         "ec2", "describe-vpc-endpoint-services", "--service-names", *endpoint_service_names
     )
 
-    # Harmless regional endpoint probe; Express API-model support is checked locally.
-    cli.run_json("ecs", "list-clusters", "--max-results", "1")
+    express_probe = cli.probe_express_gateway_service(account)
 
     vpcs = cli.run_json("ec2", "describe-vpcs")
     enis = cli.run_json("ec2", "describe-network-interfaces")
@@ -720,23 +1056,24 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
     lambda_settings = cli.run_json("lambda", "get-account-settings")
 
     rds_instance_list = rds_instances.get("DBInstances") or []
-    rds_allocated = sum(
-        int(item.get("AllocatedStorage") or 0) for item in rds_instance_list
+    rds_committed_storage = sum(
+        max(
+            int(item.get("AllocatedStorage") or 0),
+            int(item.get("MaxAllocatedStorage") or item.get("AllocatedStorage") or 0),
+        )
+        for item in rds_instance_list
     )
 
     return {
         "awsCliVersion": version,
+        "awsCliExecutable": cli_provenance,
         "identity": identity,
         "region": region,
         "enabledAvailabilityZones": enabled_azs,
         "m7iOfferings": m7i,
         "rdsOrderableOptions": rds_doc.get("OrderableDBInstanceOptions") or [],
         "endpointServices": endpoint_doc.get("ServiceNames") or [],
-        "ecsExpress": {
-            "apiModelAvailable": cli.express_api_model_available(),
-            "regionalEndpointReachable": True,
-            "probe": "aws ecs list-clusters + local describe-express-gateway-service API model",
-        },
+        "ecsExpress": express_probe,
         "quotas": {
             "fargate": service_quotas(cli, "fargate"),
             "ec2": service_quotas(cli, "ec2"),
@@ -763,11 +1100,10 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
             "codebuildProjects": len(projects.get("projects") or []),
             "dynamodbTables": len(tables.get("TableNames") or []),
             "rdsInstances": len(rds_instance_list),
-            "rdsAllocatedStorageGiB": rds_allocated,
+            "rdsCommittedStorageGiB": rds_committed_storage,
             "rdsManualSnapshots": len(rds_snapshots.get("DBSnapshots") or []),
         },
         "lambdaAccountSettings": lambda_settings,
-        "plannedIncidentMediatorMaxDbSessions": INCIDENT_MEDIATOR_MAX_DB_SESSIONS,
     }
 
 
@@ -776,8 +1112,6 @@ def build_evidence_boundary(evidence_source: str, summary_status: str) -> dict[s
         "resourceCreationPerformed": False,
         "liveAdmissionPassed": evidence_source == "live-aws"
         and summary_status == "PASS",
-        # Passing this collector is necessary but not sufficient to create production
-        # resources. The fresh cost gate and maintainer evidence disposition remain.
         "productionResourceCreationAuthorizedByThisReport": False,
         "resourceCreationBlockersRemaining": [
             "fresh exact-topology cost estimate must remain below the USD 900/month stop/review threshold",
@@ -785,12 +1119,30 @@ def build_evidence_boundary(evidence_source: str, summary_status: str) -> dict[s
         ],
         "postProvisionVerificationStillRequired": [
             "RDS IAM database authentication enabled on the created primary",
-            "exact rds-db:connect resource identity and effective IAM policy",
+            "created DBI resource ID substituted into the exact rds-db:connect resource ARN and effective IAM policy verified",
             "live RDS max_connections / connection headroom including <=1 incident-mediator session",
             "real subnet available-IP counts and Lambda/CodeBuild ENI attachment",
             "real VPC endpoint policies and route-table associations",
+            "DynamoDB tables remain PAY_PER_REQUEST with no table-level maximum below the frozen release-control requirement",
         ],
     }
+
+
+def write_report(path: Path, report: dict[str, Any]) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = (json.dumps(report, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+
+    temp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temp.write_bytes(payload)
+    temp.chmod(0o600)
+    os.replace(temp, path)
+    path.chmod(0o600)
+
+    digest_path = path.with_name(f"{path.name}.sha256")
+    digest_path.write_text(f"{digest}  {path.name}\n", encoding="utf-8")
+    digest_path.chmod(0o600)
+    return digest
 
 
 def main() -> int:
@@ -821,6 +1173,7 @@ def main() -> int:
 
     try:
         evidence_source = "fixture" if args.fixture else "live-aws"
+        provenance = collector_provenance(require_clean=evidence_source == "live-aws")
         if args.fixture:
             observed = json.loads(args.fixture.read_text(encoding="utf-8"))
         else:
@@ -840,9 +1193,11 @@ def main() -> int:
         KeyError,
         TypeError,
         ValueError,
+        subprocess.SubprocessError,
     ) as exc:
         raise SystemExit(f"P1_ADMISSION_COLLECTION_FAILED:{exc}") from exc
 
+    account = str((observed.get("identity") or {}).get("Account"))
     report = {
         "schemaVersion": SCHEMA_VERSION,
         "kind": "fpllm-platform-v0.5-p1-readonly-admission",
@@ -850,8 +1205,8 @@ def main() -> int:
         "region": REGION,
         "readOnlyNoCreate": True,
         "evidenceSource": evidence_source,
-        "vpcCidr": VPC_CIDR,
-        "plannedSubnetCidrs": list(PLANNED_SUBNET_CIDRS),
+        "collectorProvenance": provenance,
+        "plannedTopology": planned_topology(account),
         "privateApplicationControlSubnetCidrs": args.private_subnet_cidrs,
         "requireKmsInterfaceEndpoint": args.require_kms_interface_endpoint,
         "identity": observed.get("identity"),
@@ -862,14 +1217,17 @@ def main() -> int:
         "evidenceBoundary": build_evidence_boundary(evidence_source, summary["status"]),
     }
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    digest = write_report(args.output, report)
+    print(
+        json.dumps(
+            {
+                **summary,
+                "reportSha256": digest,
+                "reportPath": str(args.output),
+            },
+            sort_keys=True,
+        )
     )
-    # The report is controlled operational evidence. It contains account identity and
-    # current inventory metadata; default to owner-only permissions on POSIX systems.
-    args.output.chmod(0o600)
-    print(json.dumps(summary, sort_keys=True))
     return 0 if summary["status"] == "PASS" else 2
 
 
