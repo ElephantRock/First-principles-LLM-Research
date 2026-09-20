@@ -102,11 +102,15 @@ workerInstanceId
 lease owner / expiry fields already required by the job protocol
 ```
 
-The acquisition ID is unique for the production lease domain. Replaying the same acquisition ID is idempotent: it resolves to the already-committed lease outcome or proves that no lease was committed; it never leases a second job.
+The acquisition ID is protected by a database uniqueness constraint for the production lease domain. Replaying the same acquisition ID is idempotent: it resolves to the already-committed lease outcome or proves that no lease was committed; it never leases a second job.
+
+The lease-claim transaction is deliberately short and server-bounded. P1 must configure a PostgreSQL server-side `statement_timeout` no greater than **5 seconds** for this transaction path and a `lock_timeout` no greater than **2 seconds**. The application/request timeout must not be longer than the server-side statement bound in a way that permits an abandoned statement to remain live after the worker has begun uncertainty recovery.
 
 The worker may release the DynamoDB acquisition slot only after the PostgreSQL outcome for that exact acquisition ID is durably known.
 
 If the lease committed, clearing the acquisition slot does **not** mean the worker is idle; ordinary authoritative job/lease state continues to show the active learner job until it reaches terminal/lease-loss disposition.
+
+All lease-acquisition reconciliation and the controller's drain-time active-lease checks must query the authoritative PostgreSQL primary or another read-after-commit-consistent path. A lagging replica is not release-control evidence.
 
 ---
 
@@ -138,12 +142,14 @@ A worker crash, connection reset, database timeout, or process loss after acquis
 The protected recovery path first queries the authoritative PostgreSQL primary by the exact `leaseAcquisitionId`:
 
 1. if a lease row/job transition exists for that ID, the acquisition is classified `LEASE_COMMITTED`; the fence is cleared only after that durable outcome is recorded/reconciled, and drain waits for the resulting lease to terminate/expire normally;
-2. if no committed lease exists and the database transaction is provably no longer live, the acquisition is classified `NO_LEASE_COMMITTED`; the fence may then be cleared conditionally for that exact acquisition ID/epoch;
-3. if the outcome is uncertain, the fence remains occupied and destructive worker mutation is prohibited.
+2. if no committed lease exists, recovery waits until the configured server-side statement/lock bounds plus a fixed safety interval prove that any lease-claim transaction for that acquisition can no longer remain live, then re-queries the primary; only a second no-row result after that bound may classify `NO_LEASE_COMMITTED`;
+3. if the outcome remains uncertain or the database cannot provide authoritative primary/read-after-commit evidence, the fence remains occupied and destructive worker mutation is prohibited.
 
 A timeout/TTL may trigger reconciliation work but may not itself authorize fence clearing.
 
 The existing bounded authoritative lease-state query required by R15 is extended to include lookup by acquisition ID; P1 may realize this through a narrowly scoped diagnostic/read path, but it must not grant the promotion controller general learner-database mutation authority.
+
+Clearing an acquisition fence—whether by the worker after a known outcome or by protected recovery—must condition on the exact acquisition ID, worker instance ID, and acquisition epoch still matching. A stale recovery invocation cannot clear a newer worker's slot.
 
 ## 2.2 Drain acknowledgement is now sufficient only after acquisition reconciliation
 
@@ -159,6 +165,8 @@ promotion/generation/mutation predicates still match
 ```
 
 The controller rechecks these predicates immediately before the first destructive source-worker mutation and on journal recovery steps whose allowed transition can terminate/replace the source.
+
+Any terminal transaction that changes `workerLeasingMode` back to `ENABLED` additionally requires `activeLeaseAcquisitionId == null`; service cannot be re-enabled while an old acquisition fence remains unresolved.
 
 ---
 
@@ -188,11 +196,16 @@ protectedStackMaintenanceMode: IDLE | ACTIVE
 protectedStackMaintenanceOperationId: string | null
 protectedStackMaintenanceActorIdentity: string | null
 protectedStackMaintenanceClaimedAt: timestamp | null
+protectedStackMaintenancePlanHash: sha256 | null
+protectedStackMaintenanceChangeSetArn: string | null
+protectedStackMaintenanceProviderState: NOT_STARTED | EXECUTING | SUCCEEDED | FAILED | UNCERTAIN | null
 ```
 
 The state belongs to protected release control. Routine GitHub release roles, web, worker, builders, learner sandboxes, and ordinary application code cannot write it.
 
 Only the authorized non-GitHub protected-stack-admin path may request a normal maintenance claim, and the operation ID is generated/validated by the bounded protected maintenance-control path rather than treated as arbitrary authority to mutate release state.
+
+The maintenance plan hash commits to the reviewed bounded maintenance intent, including the protected stack/resource scope, exact source/template identity, expected pre-change protected infrastructure identity, and the statement that the live worker deployment identity must remain unchanged. If CloudFormation is used, the exact reviewed change-set ARN is bound before execution authority is granted.
 
 ## 4.1 Atomic maintenance claim from a fully quiescent state
 
@@ -216,6 +229,9 @@ protectedStackMaintenanceMode = ACTIVE
 protectedStackMaintenanceOperationId = generated operation ID
 protectedStackMaintenanceActorIdentity = authenticated stack-admin audit identity
 protectedStackMaintenanceClaimedAt = server timestamp
+protectedStackMaintenancePlanHash = exact reviewed plan hash
+protectedStackMaintenanceChangeSetArn = exact reviewed change set when applicable
+protectedStackMaintenanceProviderState = NOT_STARTED
 ```
 
 If any release-control state becomes active first, the maintenance claim fails. The administrator does not proceed from stale precondition reads.
@@ -255,16 +271,39 @@ Existing R10/R12 dispatch fences remain authoritative for external provider call
 
 ---
 
-# 6. Maintenance execution and release of the lock
+# 6. Maintenance execution, crash recovery, and release of the lock
 
 After the maintenance lock is active, the stack administrator may execute only the already-frozen R18 class of normal post-promotion changes that leave the live worker deployment identity/release-control state unchanged. Initial P1 bootstrap remains governed by R18 §1.1 and must establish the maintenance singleton in `IDLE` before ordinary release admission is enabled.
 
+Normal maintenance execution is bound to the exact `protectedStackMaintenanceOperationId`, epoch, plan hash, and change-set identity recorded by the claim. A retry/resume may not substitute a different template, stack, change set, resource scope, or maintenance intent under the same operation ID.
+
+Immediately before the first external provider mutation, the maintenance path revalidates the same operation/epoch/plan identity and confirms release control is still maintenance-fenced. It then conditionally moves provider state from `NOT_STARTED` to `EXECUTING` before executing the exact recorded change set/provider operation.
+
 If a permitted maintenance change is runtime-affecting without changing the frozen worker deployment identity, the already-authorized maintenance/drain mechanism may pause learner admission/leasing, but it must be bound to the current maintenance operation/epoch and must not mutate worker capacity, runtime digests, deployment generation, or release evidence.
+
+## 6.1 Crash/replay recovery
+
+A process crash, API timeout, or lost response after maintenance provider mutation begins does not permit a new maintenance operation and does not clear the lock.
+
+A later invocation using the **same** maintenance operation ID/epoch must reconcile the exact recorded CloudFormation/change-set/provider identity:
+
+- if the provider proves the recorded operation never began, state may return to `NOT_STARTED` or be cancelled only after pre-change invariants are independently reverified;
+- if the exact recorded operation is still running, maintenance remains `ACTIVE/EXECUTING` and no release work resumes;
+- if the exact recorded operation completed successfully, provider state becomes `SUCCEEDED` and post-change invariant verification runs;
+- if it failed in a provider-terminal state, provider state becomes `FAILED`; rollback/reconciliation follows only the reviewed maintenance/incident path;
+- if actual provider state cannot be bound to the exact recorded operation, state becomes `UNCERTAIN`, the maintenance lock remains active, and incident reconciliation is required.
+
+Time alone, a client timeout, or a completed CloudFormation stack status not bound to the recorded change-set/operation identity cannot clear maintenance.
+
+No second maintenance operation may supersede an `ACTIVE` operation merely because its owner process disappeared.
+
+## 6.2 Releasing the lock
 
 The maintenance lock is cleared only after independent post-change verification proves:
 
 ```text
-same maintenance operation ID/epoch still owns the lock
+same maintenance operation ID/epoch/plan hash still owns the lock
+provider state == SUCCEEDED, or verified NOT_STARTED cancellation path
 no release-control work became active
 actual worker ASG/LT/runtime/capacity identity == pre-maintenance recorded identity
 PROTECTED_EXECUTION_DEPLOYMENT still matches actual worker deployment
@@ -279,6 +318,9 @@ protectedStackMaintenanceMode = IDLE
 protectedStackMaintenanceOperationId = null
 protectedStackMaintenanceActorIdentity = null
 protectedStackMaintenanceClaimedAt = null
+protectedStackMaintenancePlanHash = null
+protectedStackMaintenanceChangeSetArn = null
+protectedStackMaintenanceProviderState = null
 ```
 
 while retaining the incremented epoch as monotonic history.
@@ -307,25 +349,29 @@ P1 must prove, in addition to every earlier gate:
 
 1. a worker cannot begin a PostgreSQL lease claim without first reserving the protected acquisition slot while service mode is `ENABLED`;
 2. drain transition and acquisition reservation are mutually exclusive atomic outcomes on the same protected state;
-3. every committed PostgreSQL learner lease records the exact acquisition ID and service-control epoch atomically with lease ownership;
-4. an accepted-but-unrecorded database lease is rediscovered by acquisition ID before the fence can clear;
-5. timeout/TTL alone cannot clear an acquisition fence;
-6. a drain request that loses the race to an acquisition waits for that exact acquisition to reconcile and then observes any resulting active lease before destructive mutation;
-7. a drain request that wins first prevents the worker from starting the PostgreSQL lease transaction;
-8. host loss while an acquisition is unresolved cannot let a replacement worker bypass the fence;
-9. destructive worker replacement requires null acquisition slot + no unresolved acquisition + exact drain acknowledgement/lease-state predicates;
-10. normal protected-stack maintenance claim is one atomic transaction from fully quiescent release-control state;
-11. admission, supersession, build-attempt/slot reservation, dispatch authorization, promotion/recovery claim, and deployment mutation claims all fail while maintenance is active;
-12. the release/maintenance race is tested in both directions so exactly one side acquires authority;
-13. stale maintenance operations cannot clear a newer maintenance epoch;
-14. normal maintenance cannot change the frozen live worker deployment identity or release-control evidence and cannot resume releases until post-change invariants are independently proven;
-15. emergency break-glass remains incident-only and cannot synthesize either the lease-acquisition fence evidence or the maintenance-lock evidence required by the normal path.
+3. every committed PostgreSQL learner lease records the exact acquisition ID and service-control epoch atomically with lease ownership and enforces acquisition-ID uniqueness;
+4. lease-claim statement/lock timeouts satisfy the frozen server-side bounds and uncertainty recovery waits beyond those bounds before a second authoritative primary lookup;
+5. an accepted-but-unrecorded database lease is rediscovered by acquisition ID before the fence can clear;
+6. timeout/TTL alone cannot clear an acquisition fence;
+7. a drain request that loses the race to an acquisition waits for that exact acquisition to reconcile and then observes any resulting active lease before destructive mutation;
+8. a drain request that wins first prevents the worker from starting the PostgreSQL lease transaction;
+9. host loss while an acquisition is unresolved cannot let a replacement worker bypass the fence;
+10. destructive worker replacement requires null acquisition slot + no unresolved acquisition + exact drain acknowledgement/lease-state predicates;
+11. stale acquisition recovery cannot clear a newer acquisition ID/epoch, and leasing cannot be re-enabled while an acquisition slot remains non-null;
+12. normal protected-stack maintenance claim is one atomic transaction from fully quiescent release-control state;
+13. admission, supersession, build-attempt/slot reservation, dispatch authorization, promotion/recovery claim, and deployment mutation claims all fail while maintenance is active;
+14. the release/maintenance race is tested in both directions so exactly one side acquires authority;
+15. maintenance execution is bound to the exact operation/epoch/plan hash/change-set identity and a retry cannot substitute a different provider mutation;
+16. a lost provider response leaves maintenance active until the exact recorded operation is reconciled; time alone cannot clear it;
+17. stale maintenance operations cannot clear or supersede a newer/active maintenance epoch;
+18. normal maintenance cannot change the frozen live worker deployment identity or release-control evidence and cannot resume releases until post-change invariants are independently proven;
+19. emergency break-glass remains incident-only and cannot synthesize either the lease-acquisition fence evidence or the maintenance-lock evidence required by the normal path.
 
 ---
 
 # 9. Review-state boundary
 
-Round 21 closes FPR21-01 and FPR21-02 at the decision/specification level. It does not claim the acquisition fence, PostgreSQL acquisition correlation, maintenance lock, cross-operation race tests, IAM enforcement, AWS/DynamoDB/PostgreSQL configuration, or production evidence are implemented.
+Round 21 closes FPR21-01 and FPR21-02 at the decision/specification level. It does not claim the acquisition fence, PostgreSQL acquisition correlation/timeout enforcement, maintenance lock/provider reconciliation, cross-operation race tests, IAM enforcement, AWS/DynamoDB/PostgreSQL configuration, or production evidence are implemented.
 
 The exact resulting HEAD must now:
 
