@@ -105,6 +105,13 @@ jobs:
           print('private evaluator public commitment: VALID')
           PY
 
+      - name: Validate P1 read-only admission tooling
+        run: |
+          python -m py_compile \
+            scripts/ops/p1_readonly_admission.py \
+            scripts/ci/test_p1_readonly_admission.py
+          python -m unittest -v scripts.ci.test_p1_readonly_admission
+
       - name: Validate executable Causal Attention runtime images
         run: bash scripts/ci/validate_causal_attention_runtime.sh
 
