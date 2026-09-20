@@ -65,12 +65,14 @@ ECR repository: fpllm/hidden-evaluator-base
 region:         eu-west-1
 contents:       Python/PyTorch/runtime dependencies and non-secret evaluator runtime only
 private tests:  absent
-identity:       immutable ECR digest + OCI source-revision/testBundle/runtime labels
+identity:       immutable ECR digest + retained release provenance + OCI source/testBundle/runtime labels
 ```
 
 The GitHub deployment path may push this one additional non-secret repository under the same non-hidden release authority already frozen for web/worker/test-runtime images. It receives no push authority to `fpllm/hidden-evaluator`.
 
-P1 must prove the base image contains no private evaluator bundle/material and that its recorded OCI source revision equals the frozen platform source SHA. The trusted release approver in §3 approves an exact base image digest; a mutable tag is never sufficient.
+P1 must prove the base image contains no private evaluator bundle/material. The trusted release approver in §3 approves an exact digest only after matching it to retained release evidence for the exact reviewed platform source SHA; an OCI label or mutable tag by itself is not sufficient provenance.
+
+Before sensitive assembly, the protected build also verifies that the selected base image has no Docker `ONBUILD` triggers. This prevents a base image from injecting caller-controlled build instructions that could act on the private bundle when the child image is assembled.
 
 This split leaves CodeBuild with only one sensitive assembly operation: combine an already-approved base image digest with the already-approved private evaluator bundle using fixed protected build logic.
 
@@ -85,7 +87,7 @@ table:           fpllm-beta-sensitive-release
 billing mode:    PAY_PER_REQUEST
 encryption:      DynamoDB encryption at rest
 PITR:            enabled
-public endpoint: none exposed by the application; AWS IAM control-plane/data API only
+public endpoint: none exposed by the application; AWS IAM data API only
 ```
 
 The table contains **non-secret release metadata only**. It never stores evaluator source bytes, OAuth/App secrets, database credentials, or KMS plaintext.
@@ -108,7 +110,7 @@ One active approved-candidate record binds at minimum:
 approvalId / monotonically unique candidate identity
 platform source SHA
 hidden-evaluator-base ECR digest
-base-image OCI provenance identity
+base-image retained release-provenance identity
 private evaluator S3 bucket/key/version
 private evaluator committed SHA-256
 private evaluator archive byte size
@@ -118,6 +120,7 @@ approval timestamp
 approval actor/audit identity
 state = approved | building | succeeded | failed_locked
 buildStartCount
+active CodeBuild build ID when building
 resulting hidden-evaluator digest when succeeded
 ```
 
@@ -127,12 +130,13 @@ The candidate writer is a trusted release approver using short-lived federated A
 
 Before creating/replacing the active approved candidate, the approver procedure must verify:
 
-1. the base image digest exists in `fpllm/hidden-evaluator-base` and its OCI source revision is the intended reviewed platform SHA;
+1. the base image digest exists in `fpllm/hidden-evaluator-base` and matches retained release evidence for the intended reviewed platform source SHA;
 2. the base image contains no private evaluator material according to the P1 image-content/provenance gate;
-3. the private evaluator object version/size/SHA-256 matches `hidden-tests/phase1/causal-attention/private-bundle-commitment.json`;
-4. the private object version exists and is addressable immutably for the release operation;
-5. `testBundleId` and evaluator version match the committed release contract;
-6. the candidate record contains only non-secret metadata.
+3. the base image configuration has no `ONBUILD` triggers and matches the expected runtime-role/testBundle contract;
+4. the private evaluator object version/size/SHA-256 matches `hidden-tests/phase1/causal-attention/private-bundle-commitment.json`;
+5. the private object version exists and is addressable immutably for the release operation;
+6. `testBundleId` and evaluator version match the committed release contract;
+7. the candidate record contains only non-secret metadata.
 
 Creating a new approval is an auditable release-approval action. GitHub can trigger an already-approved candidate but cannot select, modify, reset, or replace it.
 
@@ -190,26 +194,32 @@ maximum CodeBuild starts per approvalId: 3
 successful approvalId: cannot be rebuilt
 failed third start: state -> failed_locked
 new build after success/failed_locked: requires a new trusted approvalId
-requestId replay: returns the existing disposition/build identity
+requestId replay: returns/reconciles the existing disposition/build identity
 ```
 
 Thus a GitHub-controlled caller cannot create unbounded sensitive builds by changing request IDs.
 
-## 4.3 Broker authority
+## 4.3 Build-status reconciliation
+
+The broker owns state reconciliation. On every invocation it first checks any recorded active build ID with `codebuild:BatchGetBuilds` and conditionally updates the candidate to its current disposition before deciding whether another start is permitted. A replay may therefore refresh status, but it never starts a second concurrent build.
+
+A failed build with `buildStartCount < 3` may be retried only by a new bounded request ID after the failed state has been durably reconciled. A successful build records the final hidden-evaluator digest and makes the approval terminal. The GitHub caller cannot write these state transitions directly.
+
+## 4.4 Broker authority
 
 The broker role may:
 
 - read/update only the release-control/idempotency records in `fpllm-beta-sensitive-release` required for the active approved candidate;
 - call `codebuild:StartBuild` only on the exact hidden-evaluator project ARN;
+- call `codebuild:BatchGetBuilds` only for release-status reconciliation;
 - pass only the small allowlisted environment-variable set constructed from the approved candidate record;
-- optionally read the status of the resulting build if required by the orchestration path;
 - emit bounded structured logs/metrics for release correlation.
 
 The broker cannot read/decrypt the private evaluator object itself and receives no private-bundle S3 content permission or release-material KMS decrypt permission.
 
 ---
 
-# 5. Sensitive CodeBuild project is fixed-input infrastructure
+# 5. Sensitive CodeBuild project is fixed-input, private-egress infrastructure
 
 Freeze `fpllm-beta-hidden-evaluator` as:
 
@@ -225,6 +235,8 @@ service role:         fixed hidden-evaluator CodeBuild role
 timeout:              fixed <= 30 minutes
 concurrent builds:    1
 public build access:  disabled
+VPC attachment:       required
+Internet/NAT route:   none
 ```
 
 The fixed protected buildspec does **not** execute scripts or a Dockerfile supplied by the GitHub caller or by a mutable public source context.
@@ -232,7 +244,7 @@ The fixed protected buildspec does **not** execute scripts or a Dockerfile suppl
 It receives only allowlisted values from the protected broker, then:
 
 1. pulls the exact approved `fpllm/hidden-evaluator-base@sha256:...` image;
-2. verifies the base digest/provenance identity against the approved candidate;
+2. verifies the base digest/provenance identity and confirms its Docker `ONBUILD` list is empty;
 3. downloads the exact approved private evaluator S3 object version;
 4. verifies its byte size and committed SHA-256;
 5. assembles the final image with a **fixed protected packaging recipe** whose sensitive step only adds the verified private bundle to the approved base image;
@@ -240,6 +252,35 @@ It receives only allowlisted values from the protected broker, then:
 7. pushes only to `fpllm/hidden-evaluator`;
 8. records the resulting digest and non-secret provenance;
 9. removes normal-path plaintext private material from the ephemeral workspace.
+
+## 5.1 Sensitive-build network boundary
+
+The sensitive CodeBuild project runs in dedicated private build subnets with no Internet gateway/NAT route usable by the build ENIs and a security group with no ingress.
+
+The build receives only the private AWS connectivity required for the fixed operation:
+
+```text
+S3 gateway endpoint             exact release-material bucket path + ECR layer access required by ECR
+ECR API interface endpoint      approved base pull/final image push APIs
+ECR DKR interface endpoint      Docker registry pull/push
+CloudWatch Logs interface       dedicated sensitive-build log group
+AmazonProvidedDNS               normal VPC endpoint name resolution
+```
+
+If implementation proves a direct KMS API call is required from the build container, P1 may add the regional KMS interface endpoint with an endpoint policy limited to the release-material key and record that realized dependency. This does not authorize general Internet/NAT egress.
+
+Endpoint policies and the CodeBuild security group must narrow traffic/resources to the practical minimum while preserving ECR's documented S3 layer path. The build must not acquire a public IP and must not use a NAT gateway. If a required production dependency cannot be reached through the selected private AWS endpoints, P0 reopens before adding general egress.
+
+AWS documents VPC endpoints/PrivateLink as the way to keep CodeBuild/AWS-service traffic on private AWS connectivity, and ECR documents that private image pull/push uses the ECR API/DKR endpoints plus S3 for image layers.
+
+Official basis:
+
+- CodeBuild VPC/traffic privacy: https://docs.aws.amazon.com/codebuild/latest/userguide/security-traffic-privacy.html
+- CodeBuild VPC support: https://docs.aws.amazon.com/codebuild/latest/userguide/vpc-support.html
+- ECR VPC endpoints and S3 layer dependency: https://docs.aws.amazon.com/AmazonECR/latest/userguide/vpc-endpoints.html
+- S3 gateway endpoints: https://docs.aws.amazon.com/vpc/latest/privatelink/vpc-endpoints-s3.html
+
+## 5.2 CodeBuild role
 
 The CodeBuild service role may pull only the approved base-image repository, read the private evaluator release-material path/version needed by this build, use only the release-material KMS key required for that object, write its dedicated logs, and push only the final hidden-evaluator repository. It receives no DB, OAuth/App/webhook, learner-evidence, or worker-administration credential.
 
@@ -254,8 +295,9 @@ The GitHub OIDC deployment role must not be able to defeat §1 indirectly by mod
 The following resources belong to a **protected sensitive-release infrastructure stack** whose create/update/delete authority is held only by a trusted federated AWS operator / dedicated protected CloudFormation execution role:
 
 ```text
-hidden-evaluator CodeBuild project + fixed buildspec/packaging recipe
-CodeBuild service role
+hidden-evaluator CodeBuild project + fixed buildspec/packaging recipe + VPC attachment
+CodeBuild service role and sensitive-build security group
+sensitive-build private subnet/endpoint policies where dedicated
 release broker Lambda + execution role
 fpllm-beta-sensitive-release DynamoDB table and policies
 private evaluator release-material S3 bucket/prefix policy
@@ -283,7 +325,7 @@ This is not console-only infrastructure: the protected stack remains version-con
 
 ---
 
-# 7. Required authorization and abuse-control tests
+# 7. Required authorization, network, and abuse-control tests
 
 P1 must retain explicit evidence that the GitHub OIDC broker/deploy principals cannot:
 
@@ -294,7 +336,7 @@ P1 must retain explicit evidence that the GitHub OIDC broker/deploy principals c
 - decrypt the private evaluator KMS key;
 - push to the final hidden-evaluator ECR repository;
 - assume the protected sensitive-release CloudFormation execution role;
-- update/delete the protected release-material S3/KMS/CodeBuild/broker/DynamoDB stack.
+- update/delete the protected release-material S3/KMS/CodeBuild/broker/DynamoDB/network stack.
 
 P1 must also prove positively that:
 
@@ -304,27 +346,29 @@ P1 must also prove positively that:
 - multiple distinct request IDs cannot create concurrent or unbounded builds for one approval;
 - a successful approval cannot be rebuilt and a third failed start locks the approval until trusted reapproval;
 - broker invocation starts a build only for the current trusted approved candidate;
-- extra caller-selected build inputs cannot alter the base digest, private object, buildspec, service role, cache, logs, artifacts, or privileged mode;
+- extra caller-selected build inputs cannot alter the base digest, private object, buildspec, service role, cache, logs, artifacts, privileged mode, or VPC configuration;
 - the broker role cannot read/decrypt private evaluator bytes;
 - the CodeBuild role can read the approved private material path, pull the approved base, and push only the final hidden-evaluator image;
 - changing/resetting the approved candidate requires the trusted federated approver path;
-- the final sensitive packaging step executes no arbitrary source-controlled command after private material is introduced.
+- the approved base has no `ONBUILD` trigger and the final sensitive packaging step executes no arbitrary source-controlled command after private material is introduced;
+- the sensitive build has no public IP/NAT/Internet path and can reach only the selected private AWS endpoints/resources;
+- a sentinel exfiltration attempt to a public Internet destination fails while required S3/ECR/Logs operations still succeed.
 
 ---
 
 # 8. Cost, failure, and exit consequences
 
-The protected broker adds one low-volume Lambda and one low-volume on-demand DynamoDB table in `eu-west-1`, plus one non-secret ECR base repository. Their expected beta usage is negligible relative to the existing USD 400–700 planning envelope, but the mandatory pre-create AWS Pricing Calculator/cost review must include them where the calculator supports the service and actual billing evidence must include them after provisioning.
+The protected broker adds one low-volume Lambda and one low-volume on-demand DynamoDB table in `eu-west-1`, one non-secret ECR base repository, and private endpoints/dedicated subnet capacity for the sensitive build. The mandatory pre-create AWS Pricing Calculator/cost review must include these resources where supported; the existing USD 400–700 planning range remains a planning target, not a guarantee, and the frozen USD 900 stop/review threshold remains authoritative.
 
 Failure model:
 
-- broker/DynamoDB/CodeBuild unavailable -> new hidden-evaluator release is blocked; already-running production learner services are not rewritten;
+- broker/DynamoDB/CodeBuild/private endpoint unavailable -> new hidden-evaluator release is blocked; already-running production learner services are not rewritten;
 - broker invocation replay -> idempotent existing disposition;
 - repeated build failure -> at most three starts, then trusted reapproval required;
-- approved base/private object missing or hash mismatch -> fail closed before final image promotion;
-- protected-stack drift -> release blocked until reconciled through the trusted protected deployment path.
+- approved base/private object missing or hash/provenance mismatch -> fail closed before final image promotion;
+- protected-stack drift or unexpected Internet reachability -> release blocked until reconciled through the trusted protected deployment path.
 
-Exit path remains ordinary AWS/IaC replacement: the broker contract is small and the approved-candidate record is non-secret metadata; OCI base/final images and the public commitment remain portable release identities. Replacing Lambda/DynamoDB later requires a P0 amendment because it changes the sensitive-release trust boundary.
+Exit path remains ordinary AWS/IaC replacement: the broker contract is small and the approved-candidate record is non-secret metadata; OCI base/final images and the public commitment remain portable release identities. Replacing Lambda/DynamoDB or materially changing the private-build network boundary later requires a P0 amendment because it changes the sensitive-release trust boundary.
 
 ---
 
@@ -336,12 +380,13 @@ The hidden-evaluator release evidence package now binds:
 platform source SHA
 approved-candidate approvalId/state/version
 trusted approver audit identity + approval timestamp
-non-secret evaluator-base ECR digest + OCI provenance
+non-secret evaluator-base ECR digest + retained source provenance
 private evaluator object version + committed SHA-256 + bytes
 release-broker request/disposition identity
 CodeBuild project + build ID/start count
 fixed buildspec/packaging configuration identity
 CodeBuild service-role policy identity
+sensitive-build VPC/subnet/SG/endpoint-policy identity + no-Internet preflight
 final hidden-evaluator ECR digest
 protected-stack CloudFormation/source identity
 ```
@@ -352,7 +397,7 @@ GitHub Actions workflow evidence records the broker invocation and resulting rel
 
 # 10. Review-state boundary
 
-This round closes the sensitive-build invocation authority gap at the **decision/specification** level. It does not claim that the broker, protected stack, DynamoDB release control, IAM denies, evaluator-base split, or production CodeBuild path are implemented or verified.
+This round closes the sensitive-build invocation authority gap at the **decision/specification** level. It does not claim that the broker, protected stack, DynamoDB release control, IAM denies, evaluator-base split, private endpoint network, or production CodeBuild path are implemented or verified.
 
 The merge sequence restarts from this correction:
 
