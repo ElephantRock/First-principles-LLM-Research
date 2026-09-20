@@ -15,12 +15,13 @@ The exhaustive maintainer re-review of the round-9 candidate found one remaining
 |---|---|---|---|
 | FPR10-01 | HIGH | The broker freezes one active build per component and bounded start counts, but an AWS `StartBuild` call is external to DynamoDB. A broker failure after CodeBuild accepts a start but before the returned build ID is durably stored can leave an untracked running build. A later retry could start a second build, violating the one-active-build/start-count invariants and creating ambiguous result receipts. | Reserve a durable logical build-start intent before the API call, use CodeBuild's native idempotency token for immediate retries, pass a non-secret logical-attempt correlation value, and require broker recovery to discover/reconcile an accepted build before another logical start may be allocated. |
 
-AWS CodeBuild documents a native `idempotencyToken` on `StartBuild`; the token is valid for five minutes. `BatchGetBuilds` returns build environment metadata, allowing the broker to verify a bounded non-secret release-attempt correlation value during recovery.
+AWS CodeBuild documents a native `idempotencyToken` on `StartBuild`; the token is valid for five minutes. `BatchGetBuilds` returns build environment metadata, allowing the broker to verify a bounded non-secret release-attempt correlation value during recovery. `ListBuildsForProject` supports project-scoped IAM authorization and supplies the bounded build-ID discovery path required before `BatchGetBuilds`.
 
 Official basis:
 
 - https://docs.aws.amazon.com/codebuild/latest/APIReference/API_StartBuild.html
 - https://docs.aws.amazon.com/codebuild/latest/APIReference/API_BatchGetBuilds.html
+- https://docs.aws.amazon.com/codebuild/latest/userguide/auth-and-access-control-permissions-reference.html
 
 Precedence inside the P0 record is now:
 
@@ -112,15 +113,26 @@ activeBuildId = null
 
 it must treat the `StartBuild` outcome as ambiguous and **must not allocate another logical attempt yet**.
 
+The broker's protected role is therefore extended with read-only recovery authority on **only the three exact protected CodeBuild project ARNs**:
+
+```text
+codebuild:ListBuildsForProject
+codebuild:BatchGetBuilds
+```
+
+This does not add `ListBuilds` account-wide discovery, `BatchGetProjects`, project mutation, debug-session, stop/retry, or any new image/private-material authority. `StartBuild` remains limited to the exact protected project ARNs already frozen by the broker contract.
+
 Recovery order:
 
-1. query the exact protected CodeBuild project for builds created at/after the logical-attempt reservation time, using bounded pagination appropriate to the low-volume release project;
+1. call `ListBuildsForProject` on the exact component project and paginate only as far as needed to cover builds created at/after the logical-attempt reservation time, with a bounded project-release scan limit frozen in P1 from the single-digit release cadence;
 2. obtain candidate build metadata with `BatchGetBuilds`;
 3. match only a build whose project plus non-secret correlation values exactly equal the reserved `approvalId`/component/`logicalAttemptId`/ordinal/source SHA;
 4. if exactly one accepted build matches, conditionally persist that build ID and continue ordinary reconciliation;
 5. if no build matches and the native CodeBuild idempotency-token window is still valid, the broker may repeat the **same** `StartBuild` request with the same token/parameters;
 6. after the native idempotency window expires, perform a final bounded discovery/reconciliation pass before classifying the reserved logical attempt as `no_start_observed`;
 7. only after that terminal no-start disposition is durably recorded may the broker allocate a later logical attempt, subject to the existing three-start limit.
+
+If the bounded project scan cannot prove that all builds at/after the reservation boundary were examined, recovery fails closed rather than classifying `no_start_observed`.
 
 If more than one CodeBuild execution matches the same logical attempt identity, the component enters an internal release-invariant failure state and no additional build may start until protected operator investigation. The broker must not guess which execution is authoritative.
 
@@ -154,10 +166,12 @@ P1 must prove at minimum:
 
 - broker failure before `StartBuild` leaves a reserved attempt that can be deterministically classified without allocating a duplicate;
 - broker failure after CodeBuild accepted the start but before build-ID persistence recovers the exact accepted build through the logical-attempt correlation path;
+- broker recovery can list builds only for the three exact protected projects and cannot perform account-wide CodeBuild discovery;
 - immediate repeated `StartBuild` for one logical attempt uses the same native CodeBuild idempotency token and cannot create a second accepted request with changed parameters;
 - a retry of the same logical attempt does not increment `buildStartCount` again;
 - no fourth logical attempt can be reserved under one approval/component;
 - `RetryBuild` is not used to evade the frozen start-count model;
+- a scan that cannot prove coverage of the reservation interval fails closed;
 - more than one discovered build for one logical attempt fails closed;
 - stale/orphan result receipts cannot be canonicalized;
 - the hidden-evaluator builder's private/no-Internet boundary is unchanged by the added non-secret correlation metadata.
@@ -166,7 +180,7 @@ P1 must prove at minimum:
 
 # 6. Review-state boundary
 
-Round 10 closes FPR10-01 at the decision/specification level. It does not claim build-intent transactions, native idempotency tokens, build discovery, correlation metadata, or crash recovery are implemented.
+Round 10 closes FPR10-01 at the decision/specification level. It does not claim build-intent transactions, native idempotency tokens, project-scoped recovery reads, build discovery, correlation metadata, or crash recovery are implemented.
 
 The resulting exact HEAD must:
 
