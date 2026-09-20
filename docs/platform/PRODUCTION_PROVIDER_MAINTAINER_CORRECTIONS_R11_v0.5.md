@@ -14,7 +14,7 @@ The fresh exact-HEAD Codex review of `65bb2d3824623766814a2a244a7e96a30ef1076d` 
 | ID | Severity | Finding | Disposition |
 |---|---|---|---|
 | CXR11-01 | P1 | Round 7 supersession rejected `running/building` and non-null `activeBuildId`, but round 10 added an earlier `starting` state with an unresolved logical attempt and null build ID. A supersede-and-admit race could therefore replace the active candidate after a build attempt was reserved but before `StartBuild` returned. | Treat every unresolved logical attempt, including `starting`, as active for supersession; prohibit supersession while any component owns such an attempt; and revalidate active-candidate/attempt identity immediately before every external `StartBuild` call or same-attempt retry. |
-| CXR11-02 | P1 | Round 9's `failed_requires_operator` promotion state occupied the active slot but supplied no authorized transition out of that state. New promotion and supersession were both blocked, so P1 would have to invent a direct state mutation. | Freeze one protected promotion-recovery mediator, capture the pre-promotion production pair before mutation, permit only bounded target-reconcile or exact-prior-pair rollback recovery, and make the mediator the only authority that can terminalize `failed_requires_operator`. |
+| CXR11-02 | P1 | Round 9's `failed_requires_operator` promotion state occupied the active slot but supplied no authorized transition out of that state. New promotion and supersession were both blocked, so P1 would have to invent a direct state mutation. | Freeze one protected promotion-recovery mediator, capture the pre-promotion production state before mutation, permit only bounded target-reconcile or exact-prior-state rollback recovery, and make the mediator the only authority that can terminalize `failed_requires_operator`. |
 
 Precedence inside the P0 record is now:
 
@@ -108,9 +108,9 @@ and prove that supersession is rejected and only one candidate/build lineage rem
 
 ---
 
-# 3. Promotion claim records the exact prior production pair
+# 3. Promotion claim records the exact prior production state
 
-Round 9's immutable promotion-request record is extended. At the first successful promotion claim, before any infrastructure mutation, the protected promotion path records both the target canonical pair and the exact pre-promotion production identity:
+Round 9's immutable promotion-request record is extended. At the first successful promotion claim, before any infrastructure mutation, the protected promotion path records both the target canonical pair and the exact pre-promotion production state:
 
 ```text
 PROMOTION_REQUEST#<promotionRequestId>
@@ -120,8 +120,9 @@ PROMOTION_REQUEST#<promotionRequestId>
   targetHiddenEvaluatorDigest
   targetEvaluatorBaseDigest
 
-  previousWorkerDigest
-  previousHiddenEvaluatorDigest
+  previousDeploymentMode = PAIR | ABSENT
+  previousWorkerDigest              # required iff PAIR
+  previousHiddenEvaluatorDigest     # required iff PAIR
   previousProtectedDeploymentIdentity
 
   createdAt
@@ -129,11 +130,13 @@ PROMOTION_REQUEST#<promotionRequestId>
   lastReconciledAt
 ```
 
-The previous pair must come from the protected production deployment state that the promotion path has just reconciled, not from caller-supplied digest values.
+`PAIR` means an existing production execution tier is active and its exact worker/evaluator digests are known. `ABSENT` is permitted only for the initial production promotion when no prior execution-tier deployment exists; in that case the previous worker/evaluator digests are null and the protected deployment identity records the verified absent/disabled state.
 
-If the existing production identity cannot be established before mutation, promotion does not begin.
+The previous state must come from protected production deployment state that the promotion path has just reconciled, not from caller-supplied values.
 
-The previous pair is immutable for the promotion request and is the only rollback target authorized by the recovery path below.
+If the existing production state cannot be classified unambiguously as `PAIR` or `ABSENT` before mutation, promotion does not begin.
+
+For `PAIR`, promotion admission also verifies that both prior immutable images remain available for rollback and excludes them from lifecycle deletion until the promotion reaches a terminal `promoted` or `rolled_back` disposition. The previous state is immutable for the promotion request and is the only rollback target authorized by the recovery path below.
 
 ---
 
@@ -172,7 +175,7 @@ The function resolves every authoritative value from protected release-control s
 The recovery mediator has:
 
 - read access to only the protected promotion/candidate/control records required for the bound promotion request;
-- read-only AWS control-plane authority required to inspect the exact worker ASG/launch-template/runtime configuration and determine the currently deployed worker + hidden-evaluator immutable identities;
+- read-only AWS control-plane authority required to inspect the exact worker ASG/launch-template/runtime configuration and determine the currently deployed worker + hidden-evaluator immutable identities or prove the execution tier absent/disabled;
 - conditional write authority only for the recovery transitions in §§6–7;
 - no private evaluator S3/KMS read authority;
 - no ECR image-content read authority;
@@ -180,16 +183,22 @@ The recovery mediator has:
 - no authority to choose or deploy arbitrary image digests;
 - no protected infrastructure mutation authority.
 
-The `fpllm-beta-protected-deploy` role remains the only steady-state authority that may apply the already-frozen protected infrastructure promotion/rollback mutation. For recovery it may deploy only one of two immutable pairs already present in the bound promotion record:
+The `fpllm-beta-protected-deploy` role remains the only steady-state authority that may apply the already-frozen protected infrastructure promotion/rollback mutation. For recovery it may deploy only the bound target state or the bound prior state:
 
 ```text
-target pair   = targetWorkerDigest + targetHiddenEvaluatorDigest
-prior pair    = previousWorkerDigest + previousHiddenEvaluatorDigest
+target state:
+  targetWorkerDigest + targetHiddenEvaluatorDigest
+
+prior state when previousDeploymentMode == PAIR:
+  previousWorkerDigest + previousHiddenEvaluatorDigest
+
+prior state when previousDeploymentMode == ABSENT:
+  exact protected execution-tier absent/disabled state recorded at claim time
 ```
 
 It may not substitute a third pair under that recovery request.
 
-After the operator has reconciled or restored infrastructure, it invokes the mediator. The mediator independently reads actual deployed identity before changing release-control state.
+After the operator has reconciled or restored infrastructure, it invokes the mediator. The mediator independently reads actual deployed identity/state before changing release-control state.
 
 ---
 
@@ -225,9 +234,13 @@ A later replay of the same recovery request returns the existing promoted dispos
 
 # 7. CONFIRM_ROLLBACK terminal transition
 
-`CONFIRM_ROLLBACK` is valid under the same bound failed-recovery predicates as §6, but the mediator must independently verify that actual protected production infrastructure has been restored to the immutable **previous** worker/evaluator pair recorded before promotion began.
+`CONFIRM_ROLLBACK` is valid under the same bound failed-recovery predicates as §6.
 
-If and only if rollback identity and required rollback smoke/compatibility checks are proven, one conditional transaction writes:
+When `previousDeploymentMode == PAIR`, the mediator must independently verify that actual protected production infrastructure has been restored to the immutable prior worker/evaluator pair recorded before promotion began.
+
+When `previousDeploymentMode == ABSENT`, the mediator must independently verify the exact initial-release rollback condition: no production worker execution tier from the failed candidate is active, no candidate worker/evaluator digest remains selected in the protected launch/runtime configuration, and the protected deployment identity matches the recorded absent/disabled baseline.
+
+If and only if the bound prior state and required rollback smoke/compatibility checks are proven, one conditional transaction writes:
 
 ```text
 candidate overall state = built
@@ -250,13 +263,13 @@ If actual infrastructure is:
 
 - partially target and partially prior;
 - running any unrecorded/third digest;
-- not queryable sufficiently to prove one complete pair;
+- not queryable sufficiently to prove one complete bound state;
 - inconsistent with the bound protected deployment identity;
 - failing required recovery smoke/compatibility checks;
 
 then the mediator performs **no release-control state transition**. The candidate remains `failed_requires_operator`, the request remains bound, and the active slot remains occupied.
 
-The operator may correct infrastructure only toward the already-recorded target or prior pair, then retry the mediator with the same recovery action. No direct DynamoDB mutation is an authorized recovery procedure.
+The operator may correct infrastructure only toward the already-recorded target or prior state, then retry the mediator with the same recovery action. No direct DynamoDB mutation is an authorized recovery procedure.
 
 If recovery requires a different image pair or architectural change, stop and create a documented protected incident/change path; do not weaken this P0 contract silently.
 
@@ -272,9 +285,10 @@ The recovery evidence package binds:
 promotionRequestId
 bound approvalId
 target pair
-previous pair
+previousDeploymentMode
+previous pair or recorded ABSENT identity
 recovery action
-actual deployment identity observed
+actual deployment identity/state observed
 recovery Lambda request identity/timestamp
 CloudTrail authenticated operator session
 terminal transaction outcome
@@ -294,21 +308,22 @@ P1 must retain evidence that:
 2. the reserve-attempt / supersede race cannot move the active slot before the attempt is terminal;
 3. every initial or repeated `StartBuild` revalidates active candidate + logical attempt immediately before the external call;
 4. a broker call for a no-longer-active candidate cannot start CodeBuild;
-5. promotion claim captures the exact prior deployed worker/evaluator identity before mutation;
-6. GitHub and all non-protected principals cannot invoke `fpllm-beta-promotion-recover`;
-7. recovery mediator cannot mutate infrastructure, read private evaluator bytes, or select arbitrary digests;
-8. protected-deploy recovery can target only the recorded target or prior pair;
-9. `RECONCILE_TARGET` succeeds only after actual infrastructure equals the recorded target pair and clears the active slot atomically;
-10. `CONFIRM_ROLLBACK` succeeds only after actual infrastructure equals the recorded prior pair and returns the candidate to built/not-promoted while retaining the active slot;
-11. mixed/unknown/third-digest infrastructure fails closed with no state mutation;
-12. a terminal recovery replay is idempotent and cannot migrate to another approval;
-13. CloudTrail evidence identifies the federated recovery operator separately from GitHub release authority.
+5. promotion claim captures the exact prior deployment state before mutation and distinguishes `PAIR` from an initial-release `ABSENT` baseline;
+6. prior images for `PAIR` remain rollback-available until promotion terminalization;
+7. GitHub and all non-protected principals cannot invoke `fpllm-beta-promotion-recover`;
+8. recovery mediator cannot mutate infrastructure, read private evaluator bytes, or select arbitrary digests;
+9. protected-deploy recovery can target only the recorded target or prior state;
+10. `RECONCILE_TARGET` succeeds only after actual infrastructure equals the recorded target pair and clears the active slot atomically;
+11. `CONFIRM_ROLLBACK` succeeds only after actual infrastructure equals the recorded prior `PAIR` or `ABSENT` state and returns the candidate to built/not-promoted while retaining the active slot;
+12. mixed/unknown/third-digest infrastructure fails closed with no state mutation;
+13. a terminal recovery replay is idempotent and cannot migrate to another approval;
+14. CloudTrail evidence identifies the federated recovery operator separately from GitHub release authority.
 
 ---
 
 # 11. Review-state boundary
 
-Round 11 closes CXR11-01 and CXR11-02 at the decision/specification level. It does not claim supersession-race guards, pre-StartBuild checks, prior-pair capture, the recovery Lambda, infrastructure reconciliation, or production AWS evidence are implemented.
+Round 11 closes CXR11-01 and CXR11-02 at the decision/specification level. It does not claim supersession-race guards, pre-StartBuild checks, prior-state capture, rollback-image retention, the recovery Lambda, infrastructure reconciliation, or production AWS evidence are implemented.
 
 The exact resulting HEAD must now:
 
