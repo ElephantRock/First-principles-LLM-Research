@@ -137,7 +137,7 @@ If the sensitive-build implementation requires a direct KMS endpoint, add:
 --require-kms-interface-endpoint
 ```
 
-The collector has an explicit read-only AWS-operation allowlist. It gathers account identity, account-applied adjustable quotas, current regional consumption, exact RDS orderability/capability, regional VPC endpoint-service availability, Lambda account concurrency, and the AZ/topology information needed by the reviewed plan. It performs no create/update/delete operation.
+The collector has an explicit read-only AWS-operation allowlist. It gathers account identity, account-applied adjustable quotas, current regional consumption, exact RDS orderability/capability, regional VPC endpoint-service availability, Lambda account concurrency and existing reserved/provisioned allocations, and the AZ/topology information needed by the reviewed plan. It performs no create/update/delete operation.
 
 For adjustable account quotas that can stop provisioning, the collector requires an account-applied value and refuses to substitute the provider default when Service Quotas does not expose one. Non-adjustable hard limits already frozen in P0 are evaluated as provider constraints against the reviewed topology instead of being misrepresented as account-applied values.
 
@@ -148,7 +148,8 @@ The collector records:
 - `evidenceSource=fixture` or `evidenceSource=live-aws`;
 - the committed collector revision and script SHA-256;
 - AWS CLI v2 version, resolved executable path, and executable SHA-256 for live collection;
-- the exact incident-database user and account/region-bound `rds-db:connect` ARN template with only the future DBI resource ID left as a placeholder;
+- every currently enumerated Lambda function's reserved concurrency plus each provisioned-concurrency configuration, using the maximum of requested/allocated/available values as the conservative claim while a configuration may be converging;
+- the exact incident-database user and account/region-bound `rds-db:connect` ARN and policy templates with only the future DBI resource ID left as a placeholder;
 - a SHA-256 companion for the complete controlled report.
 
 Only a live report may set `liveAdmissionPassed=true`. Even a green live report leaves `productionResourceCreationAuthorizedByThisReport=false` because the cost and maintainer-evidence gates remain separate requirements.
@@ -173,20 +174,57 @@ The report must be green at minimum for the frozen P0 thresholds and the explici
 | ALB/VPC | >=1 ALB and >=1 VPC headroom |
 | Network safety margin | >=8 free regional security groups and >=32 free regional ENI slots before create |
 | CodeBuild | account-applied Linux/Large concurrency >=1; >=3 project headroom; P0-recorded non-adjustable VPC limits cover one build SG and two private app/control subnets |
-| Lambda | enough currently unreserved concurrency to reserve six one-unit protected functions while preserving >=100 unreserved |
+| Lambda inventory | enumerate every current function's reserved concurrency and provisioned-concurrency configs; account `ConcurrentExecutions - UnreservedConcurrentExecutions` must equal the enumerated reserved total or the report fails closed as a raced/incomplete inventory |
+| Lambda protected reservations | deduct provisioned concurrency on functions without reserved concurrency from account `UnreservedConcurrentExecutions`, then require enough effective unreserved capacity to add six one-unit protected reservations while still preserving >=100 unreserved |
 | DynamoDB | >=2 table headroom; initial beta remains PAY_PER_REQUEST |
 | DynamoDB throughput semantics | P0's 40k/40k initial per-table on-demand envelope is a provider baseline, not a fictitious account-level on-demand throughput quota; the created tables' explicit maximum-throughput configuration is verified post-create |
 | VPC endpoints | account quota plus current gateway-endpoint headroom and service availability for required endpoint types |
 | Private app/control subnets | reviewed `/24` CIDRs and >=32 usable IPv4 addresses each as a conservative P1 margin |
 | Incident mediator | VPC attachment shape fits Lambda limits, no NAT/Internet egress is selected, DynamoDB gateway access is planned, and RDS path is TCP/5432 |
-| Incident DB authority | IAM DB authentication selected for exact user `fpllm_incident_fence`; report binds `arn:aws:rds-db:eu-west-1:<account>:dbuser:<DBI_RESOURCE_ID>/fpllm_incident_fence`; created DBI resource ID/effective policy remain post-create proof |
+| Incident DB authority | IAM DB authentication selected for exact user `fpllm_incident_fence`; report binds `arn:aws:rds-db:eu-west-1:<account>:dbuser:<DBI_RESOURCE_ID>/fpllm_incident_fence` and an allow policy containing only `rds-db:connect` to that resource template; created DBI resource ID/effective policy remain post-create proof |
 | Incident DB budget | exact planned maximum of one concurrent `fpllm_incident_fence` session; live RDS `max_connections`/headroom proof remains required post-create before incident use |
 
 Any failed frozen minimum is a hard provisioning stop. A normal adjustable quota increase may be requested and the report re-run. A provider/class/region/topology substitution requires an explicit P0 amendment.
 
 ---
 
-## 6. DynamoDB on-demand boundary
+## 6. Lambda concurrency evidence boundary
+
+R19 requires the first P1 report to consider existing **reserved and provisioned** concurrency allocations, not merely the nominal Regional concurrency limit.
+
+The collector therefore combines two distinct views:
+
+```text
+GetAccountSettings:
+  ConcurrentExecutions
+  UnreservedConcurrentExecutions
+
+per-function inventory:
+  ReservedConcurrentExecutions
+  all ProvisionedConcurrencyConfigs
+```
+
+`UnreservedConcurrentExecutions` already reflects reserved concurrency. The collector independently enumerates the reserved total and requires it to match `ConcurrentExecutions - UnreservedConcurrentExecutions`; disagreement is treated as a race or incomplete observation and fails closed.
+
+Provisioned concurrency that belongs to a function with reserved concurrency is already covered by that function's reserved allocation and is not deducted again. Provisioned concurrency on a function without reserved concurrency consumes the shared account pool, so the conservative pre-create calculation is:
+
+```text
+effective unreserved
+= UnreservedConcurrentExecutions
+- provisioned concurrency not covered by function reserved concurrency
+```
+
+The admission minimum is then:
+
+```text
+effective unreserved >= 100 + 6
+```
+
+where six is the number of one-unit protected reservations frozen by the corrected topology. For a provisioned-concurrency configuration in transition, the collector uses the maximum of its requested, allocated, and available values rather than assuming the smallest transient value is safe.
+
+---
+
+## 7. DynamoDB on-demand boundary
 
 The initial protected release-control tables remain DynamoDB `PAY_PER_REQUEST`. The P0 record captured AWS's initial 40,000 read-request-unit and 40,000 write-request-unit per-table on-demand envelope.
 
@@ -194,7 +232,7 @@ AWS does not apply an account-level read/write throughput quota to on-demand tab
 
 ---
 
-## 7. Evidence handling
+## 8. Evidence handling
 
 The complete admission JSON contains AWS account identity and current infrastructure inventory. It is controlled operational evidence and must not be blindly committed to this public repository.
 
@@ -204,7 +242,7 @@ A green fixture run or repository CI run proves only collector behavior. The liv
 
 ---
 
-## 8. What remains after pre-create admission
+## 9. What remains after pre-create admission
 
 A green live no-create report is one required input to the next P1 implementation slice; it does not independently authorize provisioning and does not complete P1. Subsequent evidence must include, at minimum:
 
@@ -223,7 +261,7 @@ Only after those requirements and the governing P1 acceptance evidence are satis
 
 ---
 
-## 9. Current state
+## 10. Current state
 
 ```text
 P0: CLOSED and merged at fc46a2843ac79cef23b82b08cc08dba5a1a1b095
