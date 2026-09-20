@@ -112,6 +112,13 @@ def passing_observation() -> dict[str, object]:
                 "UnreservedConcurrentExecutions": 1000,
             }
         },
+        "lambdaConcurrencyAllocations": {
+            "functions": [],
+            "functionCount": 0,
+            "totalReservedConcurrency": 0,
+            "totalProvisionedConcurrency": 0,
+            "provisionedConcurrencyNotCoveredByReserved": 0,
+        },
     }
 
 
@@ -152,13 +159,58 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(module.AdmissionError):
             self.evaluate(observed)
 
-    def test_lambda_reservation_requires_six_plus_100_unreserved(self) -> None:
+    def test_lambda_reservation_requires_six_plus_100_effective_unreserved(self) -> None:
         observed = passing_observation()
-        observed["lambdaAccountSettings"]["AccountLimit"]["UnreservedConcurrentExecutions"] = 105
+        observed["lambdaConcurrencyAllocations"] = {
+            "functions": [],
+            "functionCount": 0,
+            "totalReservedConcurrency": 0,
+            "totalProvisionedConcurrency": 895,
+            "provisionedConcurrencyNotCoveredByReserved": 895,
+        }
+        checks, summary = self.evaluate(observed)
+        self.assertEqual(summary["status"], "FAIL")
+        failed = {check.id for check in checks if check.status == "FAIL"}
+        self.assertIn("quota.lambda-reserved-concurrency", failed)
+        self.assertNotIn("quota.lambda-reserved-inventory-consistent", failed)
+        self.assertEqual(
+            summary["lambdaEffectiveUnreservedAfterExistingProvisionedConcurrency"],
+            105,
+        )
+
+    def test_lambda_provisioned_concurrency_inside_reserved_is_not_double_counted(self) -> None:
+        observed = passing_observation()
+        observed["lambdaAccountSettings"]["AccountLimit"] = {
+            "ConcurrentExecutions": 1200,
+            "UnreservedConcurrentExecutions": 300,
+        }
+        observed["lambdaConcurrencyAllocations"] = {
+            "functions": [
+                {
+                    "functionName": "existing",
+                    "reservedConcurrency": 900,
+                    "provisionedConcurrencyClaim": 900,
+                    "provisionedConcurrencyNotCoveredByReserved": 0,
+                    "provisionedConfigurations": [],
+                }
+            ],
+            "functionCount": 1,
+            "totalReservedConcurrency": 900,
+            "totalProvisionedConcurrency": 900,
+            "provisionedConcurrencyNotCoveredByReserved": 0,
+        }
+        checks, summary = self.evaluate(observed)
+        self.assertEqual(summary["status"], "PASS")
+        self.assertEqual(summary["lambdaEffectiveUnreservedAfterExistingProvisionedConcurrency"], 300)
+        self.assertTrue(all(check.status == "PASS" for check in checks))
+
+    def test_lambda_inventory_disagreement_fails_closed(self) -> None:
+        observed = passing_observation()
+        observed["lambdaAccountSettings"]["AccountLimit"]["UnreservedConcurrentExecutions"] = 900
         checks, summary = self.evaluate(observed)
         self.assertEqual(summary["status"], "FAIL")
         self.assertIn(
-            "quota.lambda-reserved-concurrency",
+            "quota.lambda-reserved-inventory-consistent",
             {check.id for check in checks if check.status == "FAIL"},
         )
 
@@ -205,6 +257,17 @@ class AdmissionTests(unittest.TestCase):
             module.rds_db_connect_resource_template("123456789012"),
             "arn:aws:rds-db:eu-west-1:123456789012:dbuser:<DBI_RESOURCE_ID>/fpllm_incident_fence",
         )
+
+    def test_rds_connect_policy_template_has_no_wildcard_authority(self) -> None:
+        policy = module.rds_db_connect_policy_template("123456789012")
+        self.assertEqual(policy["Statement"][0]["Action"], ["rds-db:connect"])
+        self.assertEqual(
+            policy["Statement"][0]["Resource"],
+            [
+                "arn:aws:rds-db:eu-west-1:123456789012:dbuser:<DBI_RESOURCE_ID>/fpllm_incident_fence"
+            ],
+        )
+        self.assertNotIn("*", module.json.dumps(policy, sort_keys=True))
 
     def test_exact_quota_name_wins_over_partial_match(self) -> None:
         values = [
