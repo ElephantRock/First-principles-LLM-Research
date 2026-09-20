@@ -13,9 +13,9 @@ The exhaustive maintainer re-review of the round-9 candidate found one remaining
 
 | ID | Severity | Finding | Disposition |
 |---|---|---|---|
-| FPR10-01 | HIGH | The broker freezes one active build per component and bounded start counts, but an AWS `StartBuild` call is external to DynamoDB. A broker failure after CodeBuild accepts a start but before the returned build ID is durably stored can leave an untracked running build. A later retry could start a second build, violating the one-active-build/start-count invariants and creating ambiguous result receipts. | Reserve a durable logical build-start intent before the API call, use CodeBuild's native idempotency token for immediate retries, pass a non-secret logical-attempt correlation value, and require broker recovery to discover/reconcile an accepted build before another logical start may be allocated. |
+| FPR10-01 | HIGH | The broker freezes one active build per component and bounded start counts, but an AWS `StartBuild` call is external to DynamoDB. A broker failure after CodeBuild accepts a start but before the returned build ID is durably stored can leave an untracked running build. A later retry could start a second build, violating the one-active-build/start-count invariants and creating ambiguous result receipts. | Reserve a durable logical build-start intent before the API call, use CodeBuild's native idempotency token for immediate retries, pass a non-secret logical-attempt correlation value, disable provider-side automatic retries, and require broker recovery to discover/reconcile an accepted build before another logical start may be allocated. |
 
-AWS CodeBuild documents a native `idempotencyToken` on `StartBuild`; the token is valid for five minutes. `BatchGetBuilds` returns build environment metadata, allowing the broker to verify a bounded non-secret release-attempt correlation value during recovery. `ListBuildsForProject` supports project-scoped IAM authorization and supplies the bounded build-ID discovery path required before `BatchGetBuilds`.
+AWS CodeBuild documents a native `idempotencyToken` on `StartBuild`; the token is valid for five minutes. `BatchGetBuilds` returns build environment metadata, allowing the broker to verify a bounded non-secret release-attempt correlation value during recovery. `ListBuildsForProject` supports project-scoped IAM authorization and supplies the bounded build-ID discovery path required before `BatchGetBuilds`. CodeBuild also exposes automatic retry configuration/override, so the protected projects must disable provider-side retries and leave retry accounting exclusively to the broker.
 
 Official basis:
 
@@ -88,6 +88,15 @@ allowlisted non-secret release correlation values including:
 
 The correlation values are not secrets and do not authorize alternative source/buildspec/image/service-role/cache/log/artifact/privileged-mode configuration. All prior fixed-project and caller-input restrictions remain in force.
 
+For all three protected projects:
+
+```text
+provider automatic retry / project autoRetryLimit = 0
+StartBuild autoRetryLimitOverride = omitted/forbidden
+```
+
+The broker role receives no `codebuild:RetryBuild` authority. Every release retry is represented by the broker's own next bounded logical attempt ordinal; provider-side automatic/manual retries may not create executions outside that accounting model.
+
 The broker stores the returned CodeBuild build ID conditionally only if the component still references the same unresolved `logicalAttemptId`.
 
 After the build ID is stored:
@@ -97,7 +106,7 @@ component state = building
 activeBuildId = returned CodeBuild build ID
 ```
 
-Direct use of CodeBuild `RetryBuild` is not part of the v0.5 release protocol. A failed completed build consumes its reserved logical attempt; any permitted retry receives the next bounded logical attempt ordinal and a new native idempotency token.
+A failed completed build consumes its reserved logical attempt; any permitted retry receives the next bounded logical attempt ordinal and a new native idempotency token.
 
 ---
 
@@ -168,9 +177,9 @@ P1 must prove at minimum:
 - broker failure after CodeBuild accepted the start but before build-ID persistence recovers the exact accepted build through the logical-attempt correlation path;
 - broker recovery can list builds only for the three exact protected projects and cannot perform account-wide CodeBuild discovery;
 - immediate repeated `StartBuild` for one logical attempt uses the same native CodeBuild idempotency token and cannot create a second accepted request with changed parameters;
+- protected CodeBuild automatic retry is disabled and the broker cannot call `RetryBuild`;
 - a retry of the same logical attempt does not increment `buildStartCount` again;
 - no fourth logical attempt can be reserved under one approval/component;
-- `RetryBuild` is not used to evade the frozen start-count model;
 - a scan that cannot prove coverage of the reservation interval fails closed;
 - more than one discovered build for one logical attempt fails closed;
 - stale/orphan result receipts cannot be canonicalized;
@@ -180,7 +189,7 @@ P1 must prove at minimum:
 
 # 6. Review-state boundary
 
-Round 10 closes FPR10-01 at the decision/specification level. It does not claim build-intent transactions, native idempotency tokens, project-scoped recovery reads, build discovery, correlation metadata, or crash recovery are implemented.
+Round 10 closes FPR10-01 at the decision/specification level. It does not claim build-intent transactions, native idempotency tokens, provider retry configuration, project-scoped recovery reads, build discovery, correlation metadata, or crash recovery are implemented.
 
 The resulting exact HEAD must:
 
