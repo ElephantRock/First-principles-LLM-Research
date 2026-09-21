@@ -5,6 +5,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "ops" / "p1_readonly_admission.py"
@@ -28,10 +29,14 @@ def usage(maximum: float) -> dict[str, object]:
         "windowEnd": "2026-09-20T21:15:00Z",
         "periodSeconds": 60,
         "statistic": "Maximum",
-        "datapointCount": 1 if maximum else 0,
+        "datapointCount": 1,
+        "latestDatapointAt": "2026-09-20T21:14:00Z",
+        "latestDatapointAgeSeconds": 60,
         "maximumObservedVcpu": maximum,
-        "emptyWindowInterpretedAsZeroUsage": maximum == 0,
-        "datapoints": [] if maximum == 0 else [{"Maximum": maximum}],
+        "telemetryComplete": True,
+        "emptyWindow": False,
+        "maxAcceptedSampleAgeMinutes": 5,
+        "datapoints": [{"Maximum": maximum, "Timestamp": "2026-09-20T21:14:00Z"}],
     }
 
 
@@ -82,6 +87,20 @@ def passing_observation() -> dict[str, object]:
         "vcpuUsage": {
             "fargateOnDemand": usage(0),
             "ec2StandardOnDemand": usage(0),
+        },
+        "codebuildEnvironmentCapability": {
+            "regionalApiReadSucceeded": True,
+            "environmentType": "LINUX_CONTAINER",
+            "computeType": "BUILD_GENERAL1_LARGE",
+            "linuxCuratedPlatforms": ["AMAZON_LINUX", "UBUNTU"],
+            "curatedLinuxDockerImageCount": 2,
+            "curatedLinuxImageVersionCount": 4,
+            "p0ProviderMapping": {
+                "environmentType": "LINUX_CONTAINER",
+                "computeType": "BUILD_GENERAL1_LARGE",
+                "vpcSecurityGroupsMax": 5,
+                "vpcSubnetsMax": 16,
+            },
         },
         "quotas": {
             "fargate": [quota("Fargate On-Demand vCPU resource count", 6)],
@@ -225,6 +244,43 @@ class AdmissionTests(unittest.TestCase):
             {check.id for check in checks if check.status == "FAIL"},
         )
 
+    def test_empty_usage_telemetry_fails_closed(self) -> None:
+        observed = passing_observation()
+        observed["vcpuUsage"]["fargateOnDemand"] = {
+            **usage(0),
+            "datapointCount": 0,
+            "latestDatapointAt": None,
+            "latestDatapointAgeSeconds": None,
+            "maximumObservedVcpu": None,
+            "telemetryComplete": False,
+            "emptyWindow": True,
+            "datapoints": [],
+        }
+        checks, summary = self.evaluate(observed)
+        self.assertEqual(summary["status"], "FAIL")
+        self.assertIsNone(summary["fargateOnDemandVcpuHeadroom"])
+        self.assertIn(
+            "quota.fargate-ondemand-vcpu-headroom",
+            {check.id for check in checks if check.status == "FAIL"},
+        )
+
+    def test_codebuild_regional_capability_is_required(self) -> None:
+        observed = passing_observation()
+        observed["codebuildEnvironmentCapability"] = {
+            "regionalApiReadSucceeded": True,
+            "environmentType": "LINUX_CONTAINER",
+            "computeType": "BUILD_GENERAL1_LARGE",
+            "linuxCuratedPlatforms": [],
+            "curatedLinuxDockerImageCount": 0,
+            "curatedLinuxImageVersionCount": 0,
+        }
+        checks, summary = self.evaluate(observed)
+        self.assertEqual(summary["status"], "FAIL")
+        self.assertIn(
+            "availability.codebuild-linux-large-environment",
+            {check.id for check in checks if check.status == "FAIL"},
+        )
+
     def test_two_worker_azs_are_not_required(self) -> None:
         observed = passing_observation()
         observed["m7iOfferings"] = ["eu-west-1b"]
@@ -355,8 +411,7 @@ class AdmissionTests(unittest.TestCase):
     def test_service_quota_merge_preserves_applied_source_and_default_only_entries(self) -> None:
         class QuotaCli:
             def run_json(self, service: str, operation: str, *args: str):
-                self_service = service
-                if self_service != "service-quotas":
+                if service != "service-quotas":
                     raise AssertionError((service, operation, args))
                 if operation == "list-service-quotas":
                     return {
@@ -392,21 +447,101 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(by_code["L-DEFAULT"]["fpllmValueSource"], "aws-default")
 
     def test_aws_usage_parser_retains_recent_maximum(self) -> None:
+        now = module.datetime.now(module.timezone.utc).replace(microsecond=0)
+
         class MetricCli:
             def run_json(self, service: str, operation: str, *args: str):
                 self.last = (service, operation, args)
                 return {
                     "Datapoints": [
-                        {"Maximum": 2.0, "Timestamp": "2026-09-20T21:00:00Z"},
-                        {"Maximum": 5.0, "Timestamp": "2026-09-20T21:01:00Z"},
+                        {
+                            "Maximum": 2.0,
+                            "Timestamp": (now - timedelta(minutes=2)).isoformat().replace("+00:00", "Z"),
+                        },
+                        {
+                            "Maximum": 5.0,
+                            "Timestamp": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+                        },
                     ]
                 }
 
         cli = MetricCli()
         result = module.collect_recent_vcpu_usage(cli, "Fargate", "Standard/OnDemand")
+        self.assertTrue(result["telemetryComplete"])
         self.assertEqual(result["maximumObservedVcpu"], 5.0)
         self.assertEqual(result["datapointCount"], 2)
         self.assertEqual(cli.last[0:2], ("cloudwatch", "get-metric-statistics"))
+
+    def test_aws_usage_parser_empty_window_is_unknown_not_zero(self) -> None:
+        class MetricCli:
+            def run_json(self, service: str, operation: str, *args: str):
+                return {"Datapoints": []}
+
+        result = module.collect_recent_vcpu_usage(
+            MetricCli(), "Fargate", "Standard/OnDemand"
+        )
+        self.assertFalse(result["telemetryComplete"])
+        self.assertTrue(result["emptyWindow"])
+        self.assertIsNone(result["maximumObservedVcpu"])
+        self.assertIsNone(result["latestDatapointAt"])
+
+    def test_aws_usage_parser_stale_window_is_unknown(self) -> None:
+        now = module.datetime.now(module.timezone.utc).replace(microsecond=0)
+
+        class MetricCli:
+            def run_json(self, service: str, operation: str, *args: str):
+                return {
+                    "Datapoints": [
+                        {
+                            "Maximum": 0.0,
+                            "Timestamp": (now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+                        }
+                    ]
+                }
+
+        result = module.collect_recent_vcpu_usage(
+            MetricCli(), "EC2", "Standard/OnDemand"
+        )
+        self.assertFalse(result["telemetryComplete"])
+        self.assertIsNone(result["maximumObservedVcpu"])
+
+    def test_codebuild_capability_parser_requires_linux_curated_images(self) -> None:
+        result = module.summarize_codebuild_environment_capability(
+            {
+                "platforms": [
+                    {
+                        "platform": "AMAZON_LINUX",
+                        "languages": [
+                            {
+                                "language": "JAVA",
+                                "images": [
+                                    {
+                                        "name": "aws/codebuild/amazonlinux-x86_64-standard",
+                                        "description": "Linux image",
+                                        "versions": ["5.0", "6.0"],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "platform": "WINDOWS_SERVER_2022",
+                        "languages": [],
+                    },
+                ]
+            }
+        )
+        self.assertTrue(result["regionalApiReadSucceeded"])
+        self.assertEqual(result["environmentType"], "LINUX_CONTAINER")
+        self.assertEqual(result["computeType"], "BUILD_GENERAL1_LARGE")
+        self.assertEqual(result["curatedLinuxDockerImageCount"], 1)
+        self.assertEqual(result["curatedLinuxImageVersionCount"], 2)
+
+    def test_codebuild_capability_parser_fails_on_malformed_linux_catalog(self) -> None:
+        with self.assertRaises(module.AdmissionError):
+            module.summarize_codebuild_environment_capability(
+                {"platforms": [{"platform": "AMAZON_LINUX"}]}
+            )
 
     def test_rds_requires_iam_database_authentication(self) -> None:
         observed = passing_observation()
