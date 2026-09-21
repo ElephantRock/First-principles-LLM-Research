@@ -164,18 +164,37 @@ class _CapacityReservationQuotaAccountingCli:
 def collect_ec2_standard_inventory_once(cli: Any, account: str) -> dict[str, Any]:
     adapter = _CapacityReservationQuotaAccountingCli(cli)
     result = _CORE_COLLECT_EC2_STANDARD_INVENTORY_ONCE(adapter, account)
+    commitment_adjustments = sorted(
+        adapter.commitment_adjustments,
+        key=lambda item: (
+            str(item.get("capacityReservationId") or ""),
+            str(item.get("state") or ""),
+            str(item.get("reportedTotalInstanceCount") or ""),
+            str(item.get("committedInstanceCount") or ""),
+            str(item.get("quotaInstanceCount") or ""),
+        ),
+    )
+    capacity_block_exclusions = sorted(
+        adapter.capacity_block_instance_exclusions,
+        key=lambda item: (
+            str(item.get("instanceId") or ""),
+            str(item.get("capacityReservationId") or ""),
+            str(item.get("capacityBlockId") or ""),
+            str(item.get("instanceType") or ""),
+        ),
+    )
     return {
         **result,
         "capacityReservationAccounting": (
             "max(TotalInstanceCount, CommitmentInfo.CommittedInstanceCount) "
             "for provider-documented quota-counting On-Demand Capacity Reservation states"
         ),
-        "futureDatedCommitmentAdjustments": adapter.commitment_adjustments,
+        "futureDatedCommitmentAdjustments": commitment_adjustments,
         "capacityBlockInstanceAccounting": (
             "instances with InstanceLifecycle=capacity-block are excluded from Standard "
             "On-Demand vCPU usage"
         ),
-        "capacityBlockInstanceExclusions": adapter.capacity_block_instance_exclusions,
+        "capacityBlockInstanceExclusions": capacity_block_exclusions,
     }
 
 
