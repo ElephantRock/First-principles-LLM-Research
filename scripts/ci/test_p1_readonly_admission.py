@@ -108,7 +108,7 @@ def valid_observed() -> dict:
             "vpc": [
                 q("VPCs per Region", 5),
                 q("Subnets per VPC", 200),
-                q("Security groups per VPC", 2500),
+                q("VPC security groups per Region", 2500),
                 q("Network interfaces per Region", 5000),
                 q("Interface VPC endpoints per VPC", 50),
                 q("Gateway VPC endpoints per Region", 20),
@@ -127,6 +127,7 @@ def valid_observed() -> dict:
         "usage": {
             "vpcs": 0,
             "networkInterfaces": 0,
+            "securityGroups": 0,
             "gatewayVpcEndpoints": 0,
             "applicationLoadBalancers": 0,
             "codebuildProjects": 0,
@@ -178,25 +179,34 @@ class EvaluateTests(unittest.TestCase):
         self.assertEqual(summary["status"], "PASS")
         self.assertTrue(all(item.status == "PASS" for item in checks))
 
-    def test_real_security_groups_per_vpc_quota_is_required(self):
+    def test_real_regional_security_group_quota_is_required(self):
         observed = valid_observed()
         observed["quotas"]["vpc"] = [
             item
             for item in observed["quotas"]["vpc"]
-            if item["QuotaName"] != "Security groups per VPC"
-        ] + [q("VPC security groups per Region", 2500)]
+            if item["QuotaName"] != "VPC security groups per Region"
+        ] + [q("Security groups per VPC", 2500)]
         with self.assertRaises(p1.AdmissionError):
             p1.evaluate(observed, list(p1.PLANNED_PRIVATE_CONTROL_CIDRS), False)
 
-    def test_security_group_check_does_not_subtract_regional_inventory(self):
+    def test_security_group_check_subtracts_regional_inventory(self):
         observed = valid_observed()
-        observed["usage"]["securityGroups"] = 999999
+        observed["quotas"]["vpc"] = [
+            q("VPCs per Region", 5),
+            q("Subnets per VPC", 200),
+            q("VPC security groups per Region", 2500),
+            q("Network interfaces per Region", 5000),
+            q("Interface VPC endpoints per VPC", 50),
+            q("Gateway VPC endpoints per Region", 20),
+        ]
+        observed["usage"]["securityGroups"] = 2493
         checks, summary = p1.evaluate(
             observed, list(p1.PLANNED_PRIVATE_CONTROL_CIDRS), False
         )
-        self.assertEqual(summary["status"], "PASS")
-        sg = next(c for c in checks if c.id == "quota.security-groups-per-vpc")
-        self.assertEqual(sg.status, "PASS")
+        self.assertEqual(summary["status"], "FAIL")
+        sg = next(c for c in checks if c.id == "quota.security-group-headroom")
+        self.assertEqual(sg.status, "FAIL")
+        self.assertEqual(sg.observed["free"], 7.0)
 
     def test_direct_fargate_inventory_catches_launch_newer_than_metric(self):
         observed = valid_observed()
@@ -254,6 +264,7 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
         required = {
             ("ec2", "describe-instances"),
             ("ec2", "describe-instance-types"),
+            ("ec2", "describe-security-groups"),
             ("ecs", "list-clusters"),
             ("ecs", "list-tasks"),
             ("ecs", "describe-tasks"),
@@ -261,7 +272,6 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
             ("eks", "list-clusters"),
         }
         self.assertTrue(required.issubset(p1.READ_ONLY_AWS_OPERATIONS))
-        self.assertNotIn(("ec2", "describe-security-groups"), p1.READ_ONLY_AWS_OPERATIONS)
 
 
 class CloudWatchTests(unittest.TestCase):
@@ -464,7 +474,7 @@ class QuotaTests(unittest.TestCase):
                     "Quotas": [
                         {
                             "QuotaCode": "L-1",
-                            "QuotaName": "Security groups per VPC",
+                            "QuotaName": "VPC security groups per Region",
                             "Value": 2500,
                         }
                     ]
@@ -473,7 +483,7 @@ class QuotaTests(unittest.TestCase):
                     "Quotas": [
                         {
                             "QuotaCode": "L-1",
-                            "QuotaName": "Security groups per VPC",
+                            "QuotaName": "VPC security groups per Region",
                             "Value": 5,
                         }
                     ]
