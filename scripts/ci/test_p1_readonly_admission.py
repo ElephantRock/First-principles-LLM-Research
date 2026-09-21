@@ -139,7 +139,53 @@ def passing_observation() -> dict[str, object]:
             "totalProvisionedConcurrency": 0,
             "provisionedConcurrencyNotCoveredByReserved": 0,
         },
+        "lambdaConcurrencySnapshotVerification": {
+            "stable": True,
+            "method": "two-consecutive-bracketed-identical-snapshots",
+            "attemptsUsed": 2,
+        },
     }
+
+
+class LambdaInventoryCli:
+    def __init__(self, provisioned_claims: list[int]) -> None:
+        self.provisioned_claims = provisioned_claims
+        self.inventory_scan = 0
+
+    def run_json(self, service: str, operation: str, *args: str) -> dict[str, object]:
+        self.assert_lambda(service)
+        if operation == "get-account-settings":
+            return {
+                "AccountLimit": {
+                    "ConcurrentExecutions": 1000,
+                    "UnreservedConcurrentExecutions": 1000,
+                }
+            }
+        if operation == "list-functions":
+            self.inventory_scan += 1
+            return {"Functions": [{"FunctionName": "existing"}]}
+        if operation == "get-function-concurrency":
+            return {}
+        if operation == "list-provisioned-concurrency-configs":
+            index = min(self.inventory_scan - 1, len(self.provisioned_claims) - 1)
+            claim = self.provisioned_claims[index]
+            return {
+                "ProvisionedConcurrencyConfigs": [
+                    {
+                        "FunctionArn": "arn:aws:lambda:eu-west-1:123456789012:function:existing:live",
+                        "RequestedProvisionedConcurrentExecutions": claim,
+                        "AllocatedProvisionedConcurrentExecutions": claim,
+                        "AvailableProvisionedConcurrentExecutions": claim,
+                        "Status": "READY",
+                    }
+                ]
+            }
+        raise AssertionError((service, operation, args))
+
+    @staticmethod
+    def assert_lambda(service: str) -> None:
+        if service != "lambda":
+            raise AssertionError(service)
 
 
 class AdmissionTests(unittest.TestCase):
@@ -256,6 +302,111 @@ class AdmissionTests(unittest.TestCase):
             "quota.lambda-reserved-inventory-consistent",
             {check.id for check in checks if check.status == "FAIL"},
         )
+
+    def test_stable_lambda_inventory_requires_two_identical_bracketed_samples(self) -> None:
+        snapshot = module.collect_stable_lambda_concurrency_snapshot(
+            LambdaInventoryCli([10, 10]),
+            max_attempts=3,
+        )
+        self.assertTrue(snapshot["verification"]["stable"])
+        self.assertEqual(snapshot["verification"]["attemptsUsed"], 2)
+        self.assertEqual(
+            snapshot["allocations"]["provisionedConcurrencyNotCoveredByReserved"],
+            10,
+        )
+
+    def test_raced_lambda_provisioned_inventory_fails_closed(self) -> None:
+        with self.assertRaisesRegex(module.AdmissionError, "did not stabilize"):
+            module.collect_stable_lambda_concurrency_snapshot(
+                LambdaInventoryCli([10, 20, 10]),
+                max_attempts=3,
+            )
+
+    def test_express_probe_accepts_documented_resource_not_found(self) -> None:
+        cli = module.AwsCli("aws", None, "eu-west-1")
+        cli._run = lambda command: module.subprocess.CompletedProcess(
+            command,
+            255,
+            stdout="",
+            stderr=(
+                "An error occurred (ResourceNotFoundException) when calling the "
+                "DescribeExpressGatewayService operation: Resource not found"
+            ),
+        )
+        result = cli.probe_express_gateway_service("123456789012")
+        self.assertTrue(result["regionalApiRecognized"])
+        self.assertEqual(result["probeOutcome"], "expected-not-found")
+
+    def test_express_probe_classifies_unsupported_feature(self) -> None:
+        cli = module.AwsCli("aws", None, "eu-west-1")
+        cli._run = lambda command: module.subprocess.CompletedProcess(
+            command,
+            255,
+            stdout="",
+            stderr=(
+                "An error occurred (UnsupportedFeatureException) when calling the "
+                "DescribeExpressGatewayService operation: Express is not supported"
+            ),
+        )
+        result = cli.probe_express_gateway_service("123456789012")
+        self.assertFalse(result["regionalApiRecognized"])
+        self.assertEqual(result["probeOutcome"], "regional-api-unsupported")
+
+    def test_service_quota_merge_preserves_applied_source_and_default_only_entries(self) -> None:
+        class QuotaCli:
+            def run_json(self, service: str, operation: str, *args: str):
+                self_service = service
+                if self_service != "service-quotas":
+                    raise AssertionError((service, operation, args))
+                if operation == "list-service-quotas":
+                    return {
+                        "Quotas": [
+                            {
+                                "QuotaCode": "L-APPLIED",
+                                "QuotaName": "Example applied quota",
+                                "Value": 7,
+                            }
+                        ]
+                    }
+                if operation == "list-aws-default-service-quotas":
+                    return {
+                        "Quotas": [
+                            {
+                                "QuotaCode": "L-APPLIED",
+                                "QuotaName": "Example applied quota",
+                                "Value": 5,
+                            },
+                            {
+                                "QuotaCode": "L-DEFAULT",
+                                "QuotaName": "Example default-only quota",
+                                "Value": 11,
+                            },
+                        ]
+                    }
+                raise AssertionError((service, operation, args))
+
+        merged = module.service_quotas(QuotaCli(), "example")
+        by_code = {entry["QuotaCode"]: entry for entry in merged}
+        self.assertEqual(by_code["L-APPLIED"]["Value"], 7)
+        self.assertEqual(by_code["L-APPLIED"]["fpllmValueSource"], "applied")
+        self.assertEqual(by_code["L-DEFAULT"]["fpllmValueSource"], "aws-default")
+
+    def test_aws_usage_parser_retains_recent_maximum(self) -> None:
+        class MetricCli:
+            def run_json(self, service: str, operation: str, *args: str):
+                self.last = (service, operation, args)
+                return {
+                    "Datapoints": [
+                        {"Maximum": 2.0, "Timestamp": "2026-09-20T21:00:00Z"},
+                        {"Maximum": 5.0, "Timestamp": "2026-09-20T21:01:00Z"},
+                    ]
+                }
+
+        cli = MetricCli()
+        result = module.collect_recent_vcpu_usage(cli, "Fargate", "Standard/OnDemand")
+        self.assertEqual(result["maximumObservedVcpu"], 5.0)
+        self.assertEqual(result["datapointCount"], 2)
+        self.assertEqual(cli.last[0:2], ("cloudwatch", "get-metric-statistics"))
 
     def test_rds_requires_iam_database_authentication(self) -> None:
         observed = passing_observation()
