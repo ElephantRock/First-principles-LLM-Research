@@ -2,12 +2,12 @@ from __future__ import annotations
 
 """Stable P1 admission entry point over the reviewed collector core.
 
-The collector grew large during the P1 hardening cycle.  The reviewed implementation is
+The collector grew large during the P1 hardening cycle. The reviewed implementation is
 kept in ``p1_readonly_admission_core.py``; this entry point re-exports that surface and
 contains the narrowly scoped quota-accounting correction that requires future-dated EC2
 Capacity Reservation commitments to be counted even while ``TotalInstanceCount`` remains
-zero.  Live collection still enters the core ``main`` function, with its compute snapshot
-hook replaced below before execution.
+zero. Live collection still enters the core ``main`` function, with its compute snapshot
+and provenance hooks replaced below before execution.
 """
 
 import copy
@@ -25,21 +25,22 @@ sys.modules[_CORE_SPEC.name] = _core
 _CORE_SPEC.loader.exec_module(_core)
 
 # Re-export the reviewed core API first; corrected functions below intentionally replace
-# selected names in this module and the hooks used by core.collect().
+# selected names in this module and the hooks used by core.collect()/core.main().
 for _name in dir(_core):
     if not _name.startswith("__"):
         globals()[_name] = getattr(_core, _name)
 
 _CORE_COLLECT_EC2_STANDARD_INVENTORY_ONCE = _core.collect_ec2_standard_inventory_once
+_CORE_COLLECTOR_PROVENANCE = _core.collector_provenance
 
 
 class _CapacityReservationQuotaAccountingCli:
-    """Read-only response adapter for AWS's future-dated reservation quota semantics.
+    """Read-only response adapter for AWS future-dated reservation quota semantics.
 
     AWS documents ``assessing``, ``scheduled``, ``pending``, ``active`` and ``delayed``
     On-Demand Capacity Reservations as consuming the owner's On-Demand Instance quota.
     For a future-dated reservation, ``TotalInstanceCount`` can remain zero while the
-    committed capacity is carried in ``CommitmentInfo.CommittedInstanceCount``.  The core
+    committed capacity is carried in ``CommitmentInfo.CommittedInstanceCount``. The core
     inventory already handles reservation/instance double-counting; this adapter only
     normalizes the count presented to that reviewed logic to the larger provider claim.
     """
@@ -178,16 +179,58 @@ def collect_bracketed_compute_snapshot(
     )
 
 
-# core.collect() resolves this hook in the core module at call time.  Rebind it before
-# exposing/running main so both direct imports and the command-line entry point use the
-# corrected accounting path.
+def collector_provenance(require_clean: bool) -> dict[str, Any]:
+    """Bind live evidence to both the stable entry point and the reviewed core."""
+    core_provenance = _CORE_COLLECTOR_PROVENANCE(require_clean)
+    entrypoint = Path(__file__).resolve()
+    root = entrypoint.parents[2]
+    try:
+        relative = entrypoint.relative_to(root)
+    except ValueError as exc:
+        raise AdmissionError("collector entrypoint is not under the repository root") from exc
+
+    status = _core.subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--",
+            str(relative),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    clean = status.stdout.strip() == "" if status.returncode == 0 else None
+    if require_clean and clean is not True:
+        raise AdmissionError("live evidence collector entrypoint differs from committed Git")
+
+    return {
+        "gitCommit": core_provenance.get("gitCommit"),
+        "scriptPath": str(relative),
+        "scriptSha256": _core.sha256_file(entrypoint),
+        "scriptWorkingTreeClean": clean,
+        "coreScriptPath": core_provenance.get("scriptPath"),
+        "coreScriptSha256": core_provenance.get("scriptSha256"),
+        "coreScriptWorkingTreeClean": core_provenance.get("scriptWorkingTreeClean"),
+    }
+
+
+# core.collect()/core.main() resolve these hooks in the core module at call time. Rebind
+# them before exposing/running main so both direct imports and CLI execution use the
+# corrected accounting and evidence provenance paths.
 _core._compute_inventory_once = _compute_inventory_once
 _core.collect_bracketed_compute_snapshot = collect_bracketed_compute_snapshot
+_core.collector_provenance = collector_provenance
 
-# Ensure the corrected public helpers win over the initial re-export.
+# Ensure corrected public helpers win over the initial re-export.
 globals()["collect_ec2_standard_inventory_once"] = collect_ec2_standard_inventory_once
 globals()["_compute_inventory_once"] = _compute_inventory_once
 globals()["collect_bracketed_compute_snapshot"] = collect_bracketed_compute_snapshot
+globals()["collector_provenance"] = collector_provenance
 main = _core.main
 
 
