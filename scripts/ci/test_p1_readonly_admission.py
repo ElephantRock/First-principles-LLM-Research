@@ -1,57 +1,43 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import stat
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
+from subprocess import CompletedProcess
+from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "ops" / "p1_readonly_admission.py"
-spec = importlib.util.spec_from_file_location("p1_readonly_admission", MODULE_PATH)
-assert spec and spec.loader
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
+SPEC = importlib.util.spec_from_file_location("p1_readonly_admission", MODULE_PATH)
+assert SPEC and SPEC.loader
+p1 = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = p1
+SPEC.loader.exec_module(p1)
 
 
-def quota(name: str, value: float, source: str = "applied") -> dict[str, object]:
-    return {"QuotaName": name, "Value": value, "fpllmValueSource": source}
+def q(name: str, value: float) -> dict:
+    return {"QuotaName": name, "Value": value, "fpllmValueSource": "applied"}
 
 
-def usage(maximum: float) -> dict[str, object]:
-    return {
-        "namespace": "AWS/Usage",
-        "metricName": "ResourceCount",
-        "dimensions": {},
-        "windowStart": "2026-09-20T21:00:00Z",
-        "windowEnd": "2026-09-20T21:15:00Z",
-        "periodSeconds": 60,
-        "statistic": "Maximum",
-        "datapointCount": 1,
-        "latestDatapointAt": "2026-09-20T21:14:00Z",
-        "latestDatapointAgeSeconds": 60,
-        "maximumObservedVcpu": maximum,
-        "telemetryComplete": True,
-        "emptyWindow": False,
-        "maxAcceptedSampleAgeMinutes": 5,
-        "datapoints": [{"Maximum": maximum, "Timestamp": "2026-09-20T21:14:00Z"}],
+def valid_observed() -> dict:
+    now = p1.datetime.now(p1.timezone.utc).replace(microsecond=0)
+    usage_point = {
+        "Timestamp": now.isoformat().replace("+00:00", "Z"),
+        "Maximum": 0.0,
     }
-
-
-def passing_observation() -> dict[str, object]:
     return {
-        "awsCliVersion": "aws-cli/2.36.49 Python/3.13 Linux/6.8",
         "identity": {
             "Account": "123456789012",
-            "Arn": "arn:aws:iam::123456789012:role/read-only",
+            "Arn": "arn:aws:sts::123456789012:assumed-role/read-only/session",
         },
-        "region": {
-            "RegionName": "eu-west-1",
-            "OptInStatus": "opt-in-not-required",
-        },
-        "enabledAvailabilityZones": ["eu-west-1a", "eu-west-1b", "eu-west-1c"],
+        "region": {"RegionName": p1.REGION, "OptInStatus": "opt-in-not-required"},
+        "enabledAvailabilityZones": ["eu-west-1a", "eu-west-1b"],
         "m7iOfferings": ["eu-west-1a"],
         "rdsOrderableOptions": [
             {
@@ -64,18 +50,14 @@ def passing_observation() -> dict[str, object]:
                 "SupportsStorageAutoscaling": True,
                 "SupportsIAMDatabaseAuthentication": True,
                 "MinStorageSize": 20,
-                "MaxStorageSize": 65536,
-                "AvailabilityZones": [
-                    {"Name": "eu-west-1a"},
-                    {"Name": "eu-west-1b"},
-                ],
+                "MaxStorageSize": 100,
+                "AvailabilityZones": [{"Name": "eu-west-1a"}, {"Name": "eu-west-1b"}],
             }
         ],
         "endpointServices": [
             "com.amazonaws.eu-west-1.ecr.api",
             "com.amazonaws.eu-west-1.ecr.dkr",
             "com.amazonaws.eu-west-1.logs",
-            "com.amazonaws.eu-west-1.kms",
             "com.amazonaws.eu-west-1.s3",
             "com.amazonaws.eu-west-1.dynamodb",
         ],
@@ -85,58 +67,66 @@ def passing_observation() -> dict[str, object]:
             "probeOutcome": "expected-not-found",
         },
         "vcpuUsage": {
-            "fargateOnDemand": usage(0),
-            "ec2StandardOnDemand": usage(0),
+            "fargateOnDemand": {
+                "telemetryComplete": True,
+                "maximumObservedVcpu": 0.0,
+                "datapoints": [usage_point],
+            },
+            "ec2StandardOnDemand": {
+                "telemetryComplete": True,
+                "maximumObservedVcpu": 0.0,
+                "datapoints": [usage_point],
+            },
+        },
+        "computeVcpuInventory": {
+            "fargateOnDemand": {"observedVcpu": 0.0, "taskCount": 0, "tasks": []},
+            "ec2StandardOnDemand": {
+                "observedVcpu": 0.0,
+                "instanceCount": 0,
+                "instances": [],
+            },
+            "verification": {
+                "stable": True,
+                "method": "direct-inventory-before-and-after-cloudwatch-window-read",
+                "attemptsUsed": 1,
+                "inventoryFingerprintSha256": "abc",
+            },
         },
         "codebuildEnvironmentCapability": {
             "regionalApiReadSucceeded": True,
-            "environmentType": "LINUX_CONTAINER",
-            "computeType": "BUILD_GENERAL1_LARGE",
-            "linuxCuratedPlatforms": ["AMAZON_LINUX", "UBUNTU"],
-            "curatedLinuxDockerImageCount": 2,
-            "curatedLinuxImageVersionCount": 4,
-            "p0ProviderMapping": {
-                "environmentType": "LINUX_CONTAINER",
-                "computeType": "BUILD_GENERAL1_LARGE",
-                "vpcSecurityGroupsMax": 5,
-                "vpcSubnetsMax": 16,
-            },
+            "curatedLinuxDockerImageCount": 1,
         },
         "quotas": {
-            "fargate": [quota("Fargate On-Demand vCPU resource count", 6)],
+            "fargate": [q("Fargate On-Demand vCPU resource count", 20)],
             "ec2": [
-                quota(
+                q(
                     "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances",
-                    16,
+                    20,
                 )
             ],
-            "rds": [
-                quota("DB instances", 40),
-                quota("Total storage for all DB instances", 100000),
-                quota("Manual DB instance snapshots", 100),
-                quota("Reserved DB instances", 40),
-            ],
-            "elasticloadbalancing": [
-                quota("Application Load Balancers per Region", 50)
-            ],
+            "elasticloadbalancing": [q("Application Load Balancers per Region", 50)],
             "vpc": [
-                quota("VPCs per Region", 5),
-                quota("Subnets per VPC", 200),
-                quota("VPC security groups per Region", 2500),
-                quota("Network interfaces per Region", 5000),
-                quota("Interface VPC endpoints per VPC", 50),
-                quota("Gateway VPC endpoints per Region", 20),
+                q("VPCs per Region", 5),
+                q("Subnets per VPC", 200),
+                q("Security groups per VPC", 2500),
+                q("Network interfaces per Region", 5000),
+                q("Interface VPC endpoints per VPC", 50),
+                q("Gateway VPC endpoints per Region", 20),
             ],
             "codebuild": [
-                quota("Concurrently running builds for Linux/Large environment", 1),
-                quota("Build projects", 5000),
+                q("Concurrently running builds for Linux/Large", 1),
+                q("Build projects", 5000),
             ],
-            "dynamodb": [quota("Maximum number of tables", 2500)],
+            "dynamodb": [q("Maximum number of tables", 2500)],
+            "rds": [
+                q("DB instances", 40),
+                q("Total storage for all DB instances", 100000),
+                q("Manual DB instance snapshots", 100),
+            ],
         },
         "usage": {
-            "vpcs": 1,
-            "networkInterfaces": 10,
-            "securityGroups": 10,
+            "vpcs": 0,
+            "networkInterfaces": 0,
             "gatewayVpcEndpoints": 0,
             "applicationLoadBalancers": 0,
             "codebuildProjects": 0,
@@ -158,491 +148,475 @@ def passing_observation() -> dict[str, object]:
             "totalProvisionedConcurrency": 0,
             "provisionedConcurrencyNotCoveredByReserved": 0,
         },
-        "lambdaConcurrencySnapshotVerification": {
-            "stable": True,
-            "method": "two-consecutive-bracketed-identical-snapshots",
-            "attemptsUsed": 2,
-        },
     }
 
 
-class LambdaInventoryCli:
-    def __init__(self, provisioned_claims: list[int]) -> None:
-        self.provisioned_claims = provisioned_claims
-        self.inventory_scan = 0
+class FakeCli:
+    def __init__(self, responses=None):
+        self.responses = responses or {}
+        self.calls = []
 
-    def run_json(self, service: str, operation: str, *args: str) -> dict[str, object]:
-        self.assert_lambda(service)
-        if operation == "get-account-settings":
-            return {
-                "AccountLimit": {
-                    "ConcurrentExecutions": 1000,
-                    "UnreservedConcurrentExecutions": 1000,
-                }
-            }
-        if operation == "list-functions":
-            self.inventory_scan += 1
-            return {"Functions": [{"FunctionName": "existing"}]}
-        if operation == "get-function-concurrency":
-            return {}
-        if operation == "list-provisioned-concurrency-configs":
-            index = min(self.inventory_scan - 1, len(self.provisioned_claims) - 1)
-            claim = self.provisioned_claims[index]
-            return {
-                "ProvisionedConcurrencyConfigs": [
-                    {
-                        "FunctionArn": "arn:aws:lambda:eu-west-1:123456789012:function:existing:live",
-                        "RequestedProvisionedConcurrentExecutions": claim,
-                        "AllocatedProvisionedConcurrentExecutions": claim,
-                        "AvailableProvisionedConcurrentExecutions": claim,
-                        "Status": "READY",
-                    }
-                ]
-            }
-        raise AssertionError((service, operation, args))
-
-    @staticmethod
-    def assert_lambda(service: str) -> None:
-        if service != "lambda":
-            raise AssertionError(service)
+    def run_json(self, service, operation, *args):
+        self.calls.append((service, operation, args))
+        value = self.responses.get((service, operation))
+        if callable(value):
+            return value(service, operation, *args)
+        if isinstance(value, list):
+            if not value:
+                raise AssertionError(f"no response left for {(service, operation)}")
+            return value.pop(0)
+        if value is None:
+            raise AssertionError(f"unexpected call {(service, operation, args)}")
+        return value
 
 
-class AdmissionTests(unittest.TestCase):
-    def evaluate(self, observed: dict[str, object], *, require_kms: bool = False):
-        return module.evaluate(
-            observed,
-            ["10.42.16.0/24", "10.42.17.0/24"],
-            require_kms,
+class EvaluateTests(unittest.TestCase):
+    def test_valid_fixture_passes(self):
+        checks, summary = p1.evaluate(
+            valid_observed(), list(p1.PLANNED_PRIVATE_CONTROL_CIDRS), False
         )
-
-    def test_passing_fixture_passes_with_one_worker_az_and_two_rds_azs(self) -> None:
-        checks, summary = self.evaluate(passing_observation())
         self.assertEqual(summary["status"], "PASS")
-        self.assertEqual(summary["selectedAvailabilityZones"], ["eu-west-1a", "eu-west-1b"])
-        self.assertTrue(all(check.status == "PASS" for check in checks))
+        self.assertTrue(all(item.status == "PASS" for item in checks))
 
-    def test_fargate_quota_must_be_free_headroom_not_nominal_limit(self) -> None:
-        observed = passing_observation()
-        observed["vcpuUsage"]["fargateOnDemand"] = usage(1)
-        checks, summary = self.evaluate(observed)
-        self.assertEqual(summary["status"], "FAIL")
-        self.assertEqual(summary["fargateOnDemandVcpuHeadroom"], 5)
-        self.assertIn(
-            "quota.fargate-ondemand-vcpu-headroom",
-            {check.id for check in checks if check.status == "FAIL"},
+    def test_real_security_groups_per_vpc_quota_is_required(self):
+        observed = valid_observed()
+        observed["quotas"]["vpc"] = [
+            item
+            for item in observed["quotas"]["vpc"]
+            if item["QuotaName"] != "Security groups per VPC"
+        ] + [q("VPC security groups per Region", 2500)]
+        with self.assertRaises(p1.AdmissionError):
+            p1.evaluate(observed, list(p1.PLANNED_PRIVATE_CONTROL_CIDRS), False)
+
+    def test_security_group_check_does_not_subtract_regional_inventory(self):
+        observed = valid_observed()
+        observed["usage"]["securityGroups"] = 999999
+        checks, summary = p1.evaluate(
+            observed, list(p1.PLANNED_PRIVATE_CONTROL_CIDRS), False
         )
-
-    def test_ec2_standard_quota_must_leave_four_free_vcpu(self) -> None:
-        observed = passing_observation()
-        observed["quotas"]["ec2"][0]["Value"] = 4
-        observed["vcpuUsage"]["ec2StandardOnDemand"] = usage(1)
-        checks, summary = self.evaluate(observed)
-        self.assertEqual(summary["status"], "FAIL")
-        self.assertEqual(summary["ec2StandardOnDemandVcpuHeadroom"], 3)
-        self.assertIn(
-            "quota.ec2-standard-ondemand-vcpu-headroom",
-            {check.id for check in checks if check.status == "FAIL"},
-        )
-
-    def test_empty_usage_telemetry_fails_closed(self) -> None:
-        observed = passing_observation()
-        observed["vcpuUsage"]["fargateOnDemand"] = {
-            **usage(0),
-            "datapointCount": 0,
-            "latestDatapointAt": None,
-            "latestDatapointAgeSeconds": None,
-            "maximumObservedVcpu": None,
-            "telemetryComplete": False,
-            "emptyWindow": True,
-            "datapoints": [],
-        }
-        checks, summary = self.evaluate(observed)
-        self.assertEqual(summary["status"], "FAIL")
-        self.assertIsNone(summary["fargateOnDemandVcpuHeadroom"])
-        self.assertIn(
-            "quota.fargate-ondemand-vcpu-headroom",
-            {check.id for check in checks if check.status == "FAIL"},
-        )
-
-    def test_codebuild_regional_capability_is_required(self) -> None:
-        observed = passing_observation()
-        observed["codebuildEnvironmentCapability"] = {
-            "regionalApiReadSucceeded": True,
-            "environmentType": "LINUX_CONTAINER",
-            "computeType": "BUILD_GENERAL1_LARGE",
-            "linuxCuratedPlatforms": [],
-            "curatedLinuxDockerImageCount": 0,
-            "curatedLinuxImageVersionCount": 0,
-        }
-        checks, summary = self.evaluate(observed)
-        self.assertEqual(summary["status"], "FAIL")
-        self.assertIn(
-            "availability.codebuild-linux-large-environment",
-            {check.id for check in checks if check.status == "FAIL"},
-        )
-
-    def test_two_worker_azs_are_not_required(self) -> None:
-        observed = passing_observation()
-        observed["m7iOfferings"] = ["eu-west-1b"]
-        _, summary = self.evaluate(observed)
         self.assertEqual(summary["status"], "PASS")
-        self.assertEqual(summary["selectedAvailabilityZones"], ["eu-west-1b", "eu-west-1a"])
+        sg = next(c for c in checks if c.id == "quota.security-groups-per-vpc")
+        self.assertEqual(sg.status, "PASS")
 
-    def test_fails_without_two_rds_azs(self) -> None:
-        observed = passing_observation()
-        observed["rdsOrderableOptions"][0]["AvailabilityZones"] = [{"Name": "eu-west-1a"}]
-        checks, summary = self.evaluate(observed)
-        self.assertEqual(summary["status"], "FAIL")
-        self.assertIn(
-            "availability.rds-two-az-and-worker",
-            {check.id for check in checks if check.status == "FAIL"},
+    def test_direct_fargate_inventory_catches_launch_newer_than_metric(self):
+        observed = valid_observed()
+        observed["quotas"]["fargate"] = [q("Fargate On-Demand vCPU resource count", 6)]
+        observed["vcpuUsage"]["fargateOnDemand"]["maximumObservedVcpu"] = 0
+        observed["computeVcpuInventory"]["fargateOnDemand"]["observedVcpu"] = 1
+        checks, summary = p1.evaluate(
+            observed, list(p1.PLANNED_PRIVATE_CONTROL_CIDRS), False
         )
+        self.assertEqual(summary["status"], "FAIL")
+        check = next(c for c in checks if c.id == "quota.fargate-ondemand-vcpu-headroom")
+        self.assertEqual(check.status, "FAIL")
+        self.assertEqual(check.observed["effectiveObservedVcpu"], 1.0)
 
-    def test_account_applied_quota_is_required(self) -> None:
-        observed = passing_observation()
+    def test_direct_ec2_inventory_catches_launch_newer_than_metric(self):
+        observed = valid_observed()
+        observed["quotas"]["ec2"] = [q("Running On-Demand Standard", 4)]
+        observed["vcpuUsage"]["ec2StandardOnDemand"]["maximumObservedVcpu"] = 0
+        observed["computeVcpuInventory"]["ec2StandardOnDemand"]["observedVcpu"] = 4
+        checks, summary = p1.evaluate(
+            observed, list(p1.PLANNED_PRIVATE_CONTROL_CIDRS), False
+        )
+        self.assertEqual(summary["status"], "FAIL")
+        check = next(c for c in checks if c.id == "quota.ec2-standard-ondemand-vcpu-headroom")
+        self.assertEqual(check.status, "FAIL")
+        self.assertEqual(check.observed["effectiveObservedVcpu"], 4.0)
+
+    def test_unstable_compute_inventory_fails_closed(self):
+        observed = valid_observed()
+        observed["computeVcpuInventory"]["verification"]["stable"] = False
+        _, summary = p1.evaluate(
+            observed, list(p1.PLANNED_PRIVATE_CONTROL_CIDRS), False
+        )
+        self.assertEqual(summary["status"], "FAIL")
+
+    def test_default_only_quota_is_rejected(self):
+        observed = valid_observed()
         observed["quotas"]["fargate"][0]["fpllmValueSource"] = "aws-default"
-        with self.assertRaises(module.AdmissionError):
-            self.evaluate(observed)
+        with self.assertRaises(p1.AdmissionError):
+            p1.evaluate(observed, list(p1.PLANNED_PRIVATE_CONTROL_CIDRS), False)
 
-    def test_lambda_reservation_requires_six_plus_100_effective_unreserved(self) -> None:
-        observed = passing_observation()
-        observed["lambdaConcurrencyAllocations"] = {
-            "functions": [],
-            "functionCount": 0,
-            "totalReservedConcurrency": 0,
-            "totalProvisionedConcurrency": 895,
-            "provisionedConcurrencyNotCoveredByReserved": 895,
+    def test_fixture_pass_never_authorizes_resource_creation(self):
+        boundary = p1.build_evidence_boundary("fixture", "PASS")
+        self.assertFalse(boundary["liveAdmissionPassed"])
+        self.assertFalse(boundary["productionResourceCreationAuthorizedByThisReport"])
+
+
+class ReadOnlyBoundaryTests(unittest.TestCase):
+    def test_mutating_operation_is_rejected(self):
+        cli = p1.AwsCli("aws", None, p1.REGION)
+        with self.assertRaises(p1.AdmissionError):
+            cli._base_command("ec2", "run-instances")
+
+    def test_new_inventory_operations_are_read_only(self):
+        required = {
+            ("ec2", "describe-instances"),
+            ("ec2", "describe-instance-types"),
+            ("ecs", "list-clusters"),
+            ("ecs", "list-tasks"),
+            ("ecs", "describe-tasks"),
+            ("ecs", "describe-task-definition"),
+            ("eks", "list-clusters"),
         }
-        checks, summary = self.evaluate(observed)
-        self.assertEqual(summary["status"], "FAIL")
-        failed = {check.id for check in checks if check.status == "FAIL"}
-        self.assertIn("quota.lambda-reserved-concurrency", failed)
-        self.assertNotIn("quota.lambda-reserved-inventory-consistent", failed)
-        self.assertEqual(
-            summary["lambdaEffectiveUnreservedAfterExistingProvisionedConcurrency"],
-            105,
-        )
+        self.assertTrue(required.issubset(p1.READ_ONLY_AWS_OPERATIONS))
+        self.assertNotIn(("ec2", "describe-security-groups"), p1.READ_ONLY_AWS_OPERATIONS)
 
-    def test_lambda_provisioned_concurrency_inside_reserved_is_not_double_counted(self) -> None:
-        observed = passing_observation()
-        observed["lambdaAccountSettings"]["AccountLimit"] = {
-            "ConcurrentExecutions": 1200,
-            "UnreservedConcurrentExecutions": 300,
-        }
-        observed["lambdaConcurrencyAllocations"] = {
-            "functions": [
-                {
-                    "functionName": "existing",
-                    "reservedConcurrency": 900,
-                    "provisionedConcurrencyClaim": 900,
-                    "provisionedConcurrencyNotCoveredByReserved": 0,
-                    "provisionedConfigurations": [],
-                }
-            ],
-            "functionCount": 1,
-            "totalReservedConcurrency": 900,
-            "totalProvisionedConcurrency": 900,
-            "provisionedConcurrencyNotCoveredByReserved": 0,
-        }
-        checks, summary = self.evaluate(observed)
-        self.assertEqual(summary["status"], "PASS")
-        self.assertEqual(summary["lambdaEffectiveUnreservedAfterExistingProvisionedConcurrency"], 300)
-        self.assertTrue(all(check.status == "PASS" for check in checks))
 
-    def test_lambda_inventory_disagreement_fails_closed(self) -> None:
-        observed = passing_observation()
-        observed["lambdaAccountSettings"]["AccountLimit"]["UnreservedConcurrentExecutions"] = 900
-        checks, summary = self.evaluate(observed)
-        self.assertEqual(summary["status"], "FAIL")
-        self.assertIn(
-            "quota.lambda-reserved-inventory-consistent",
-            {check.id for check in checks if check.status == "FAIL"},
-        )
+class CloudWatchTests(unittest.TestCase):
+    def test_empty_window_is_unknown_not_zero(self):
+        cli = FakeCli({("cloudwatch", "get-metric-statistics"): {"Datapoints": []}})
+        result = p1.collect_recent_vcpu_usage(cli, "EC2", "Standard/OnDemand")
+        self.assertFalse(result["telemetryComplete"])
+        self.assertIsNone(result["maximumObservedVcpu"])
 
-    def test_stable_lambda_inventory_requires_two_identical_bracketed_samples(self) -> None:
-        snapshot = module.collect_stable_lambda_concurrency_snapshot(
-            LambdaInventoryCli([10, 10]),
-            max_attempts=3,
-        )
-        self.assertTrue(snapshot["verification"]["stable"])
-        self.assertEqual(snapshot["verification"]["attemptsUsed"], 2)
-        self.assertEqual(
-            snapshot["allocations"]["provisionedConcurrencyNotCoveredByReserved"],
-            10,
-        )
-
-    def test_raced_lambda_provisioned_inventory_fails_closed(self) -> None:
-        with self.assertRaisesRegex(module.AdmissionError, "did not stabilize"):
-            module.collect_stable_lambda_concurrency_snapshot(
-                LambdaInventoryCli([10, 20, 10]),
-                max_attempts=3,
-            )
-
-    def test_express_probe_accepts_documented_resource_not_found(self) -> None:
-        cli = module.AwsCli("aws", None, "eu-west-1")
-        cli._run = lambda command: module.subprocess.CompletedProcess(
-            command,
-            255,
-            stdout="",
-            stderr=(
-                "An error occurred (ResourceNotFoundException) when calling the "
-                "DescribeExpressGatewayService operation: Resource not found"
-            ),
-        )
-        result = cli.probe_express_gateway_service("123456789012")
-        self.assertTrue(result["regionalApiRecognized"])
-        self.assertEqual(result["probeOutcome"], "expected-not-found")
-
-    def test_express_probe_classifies_unsupported_feature(self) -> None:
-        cli = module.AwsCli("aws", None, "eu-west-1")
-        cli._run = lambda command: module.subprocess.CompletedProcess(
-            command,
-            255,
-            stdout="",
-            stderr=(
-                "An error occurred (UnsupportedFeatureException) when calling the "
-                "DescribeExpressGatewayService operation: Express is not supported"
-            ),
-        )
-        result = cli.probe_express_gateway_service("123456789012")
-        self.assertFalse(result["regionalApiRecognized"])
-        self.assertEqual(result["probeOutcome"], "regional-api-unsupported")
-
-    def test_service_quota_merge_preserves_applied_source_and_default_only_entries(self) -> None:
-        class QuotaCli:
-            def run_json(self, service: str, operation: str, *args: str):
-                if service != "service-quotas":
-                    raise AssertionError((service, operation, args))
-                if operation == "list-service-quotas":
-                    return {
-                        "Quotas": [
-                            {
-                                "QuotaCode": "L-APPLIED",
-                                "QuotaName": "Example applied quota",
-                                "Value": 7,
-                            }
-                        ]
-                    }
-                if operation == "list-aws-default-service-quotas":
-                    return {
-                        "Quotas": [
-                            {
-                                "QuotaCode": "L-APPLIED",
-                                "QuotaName": "Example applied quota",
-                                "Value": 5,
-                            },
-                            {
-                                "QuotaCode": "L-DEFAULT",
-                                "QuotaName": "Example default-only quota",
-                                "Value": 11,
-                            },
-                        ]
-                    }
-                raise AssertionError((service, operation, args))
-
-        merged = module.service_quotas(QuotaCli(), "example")
-        by_code = {entry["QuotaCode"]: entry for entry in merged}
-        self.assertEqual(by_code["L-APPLIED"]["Value"], 7)
-        self.assertEqual(by_code["L-APPLIED"]["fpllmValueSource"], "applied")
-        self.assertEqual(by_code["L-DEFAULT"]["fpllmValueSource"], "aws-default")
-
-    def test_aws_usage_parser_retains_recent_maximum(self) -> None:
-        now = module.datetime.now(module.timezone.utc).replace(microsecond=0)
-
-        class MetricCli:
-            def run_json(self, service: str, operation: str, *args: str):
-                self.last = (service, operation, args)
-                return {
+    def test_fresh_window_uses_maximum(self):
+        now = p1.datetime.now(p1.timezone.utc).replace(microsecond=0)
+        cli = FakeCli(
+            {
+                ("cloudwatch", "get-metric-statistics"): {
                     "Datapoints": [
                         {
-                            "Maximum": 2.0,
-                            "Timestamp": (now - timedelta(minutes=2)).isoformat().replace("+00:00", "Z"),
+                            "Timestamp": (now - timedelta(minutes=2)).isoformat(),
+                            "Maximum": 2,
                         },
                         {
-                            "Maximum": 5.0,
-                            "Timestamp": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+                            "Timestamp": (now - timedelta(minutes=1)).isoformat(),
+                            "Maximum": 3,
                         },
                     ]
                 }
-
-        cli = MetricCli()
-        result = module.collect_recent_vcpu_usage(cli, "Fargate", "Standard/OnDemand")
-        self.assertTrue(result["telemetryComplete"])
-        self.assertEqual(result["maximumObservedVcpu"], 5.0)
-        self.assertEqual(result["datapointCount"], 2)
-        self.assertEqual(cli.last[0:2], ("cloudwatch", "get-metric-statistics"))
-
-    def test_aws_usage_parser_empty_window_is_unknown_not_zero(self) -> None:
-        class MetricCli:
-            def run_json(self, service: str, operation: str, *args: str):
-                return {"Datapoints": []}
-
-        result = module.collect_recent_vcpu_usage(
-            MetricCli(), "Fargate", "Standard/OnDemand"
+            }
         )
-        self.assertFalse(result["telemetryComplete"])
-        self.assertTrue(result["emptyWindow"])
-        self.assertIsNone(result["maximumObservedVcpu"])
-        self.assertIsNone(result["latestDatapointAt"])
+        result = p1.collect_recent_vcpu_usage(cli, "EC2", "Standard/OnDemand")
+        self.assertTrue(result["telemetryComplete"])
+        self.assertEqual(result["maximumObservedVcpu"], 3.0)
 
-    def test_aws_usage_parser_stale_window_is_unknown(self) -> None:
-        now = module.datetime.now(module.timezone.utc).replace(microsecond=0)
-
-        class MetricCli:
-            def run_json(self, service: str, operation: str, *args: str):
-                return {
+    def test_stale_window_fails_closed(self):
+        now = p1.datetime.now(p1.timezone.utc).replace(microsecond=0)
+        cli = FakeCli(
+            {
+                ("cloudwatch", "get-metric-statistics"): {
                     "Datapoints": [
                         {
-                            "Maximum": 0.0,
-                            "Timestamp": (now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+                            "Timestamp": (now - timedelta(minutes=10)).isoformat(),
+                            "Maximum": 0,
                         }
                     ]
                 }
-
-        result = module.collect_recent_vcpu_usage(
-            MetricCli(), "EC2", "Standard/OnDemand"
+            }
         )
+        result = p1.collect_recent_vcpu_usage(cli, "EC2", "Standard/OnDemand")
         self.assertFalse(result["telemetryComplete"])
         self.assertIsNone(result["maximumObservedVcpu"])
 
-    def test_codebuild_capability_parser_requires_linux_curated_images(self) -> None:
-        result = module.summarize_codebuild_environment_capability(
+
+class ComputeInventoryTests(unittest.TestCase):
+    def test_ec2_inventory_counts_only_standard_on_demand(self):
+        cli = FakeCli(
+            {
+                ("ec2", "describe-instances"): {
+                    "Reservations": [
+                        {
+                            "Instances": [
+                                {
+                                    "InstanceId": "i-1",
+                                    "InstanceType": "m7i.xlarge",
+                                    "State": {"Name": "running"},
+                                },
+                                {
+                                    "InstanceId": "i-2",
+                                    "InstanceType": "m7i.xlarge",
+                                    "State": {"Name": "running"},
+                                    "InstanceLifecycle": "spot",
+                                },
+                                {
+                                    "InstanceId": "i-3",
+                                    "InstanceType": "g6.xlarge",
+                                    "State": {"Name": "running"},
+                                },
+                            ]
+                        }
+                    ]
+                },
+                ("ec2", "describe-instance-types"): {
+                    "InstanceTypes": [
+                        {"InstanceType": "m7i.xlarge", "VCpuInfo": {"DefaultVCpus": 4}}
+                    ]
+                },
+            }
+        )
+        result = p1.collect_ec2_standard_inventory_once(cli)
+        self.assertEqual(result["observedVcpu"], 4)
+        self.assertEqual(result["instanceCount"], 1)
+        self.assertEqual(result["instances"][0]["instanceId"], "i-1")
+
+    def test_fargate_inventory_counts_on_demand_not_spot(self):
+        cli = FakeCli(
+            {
+                ("eks", "list-clusters"): {"clusters": []},
+                ("ecs", "list-clusters"): {"clusterArns": ["c1"]},
+                ("ecs", "list-tasks"): {"taskArns": ["t1", "t2"]},
+                ("ecs", "describe-tasks"): {
+                    "failures": [],
+                    "tasks": [
+                        {
+                            "taskArn": "t1",
+                            "desiredStatus": "RUNNING",
+                            "lastStatus": "RUNNING",
+                            "capacityProviderName": "FARGATE",
+                            "cpu": "1024",
+                        },
+                        {
+                            "taskArn": "t2",
+                            "desiredStatus": "RUNNING",
+                            "lastStatus": "RUNNING",
+                            "capacityProviderName": "FARGATE_SPOT",
+                            "cpu": "2048",
+                        },
+                    ],
+                },
+            }
+        )
+        result = p1.collect_fargate_inventory_once(cli)
+        self.assertEqual(result["observedVcpu"], 1.0)
+        self.assertEqual(result["taskCount"], 1)
+
+    def test_eks_presence_fails_closed_for_complete_fargate_inventory(self):
+        cli = FakeCli({("eks", "list-clusters"): {"clusters": ["other"]}})
+        with self.assertRaises(p1.AdmissionError):
+            p1.collect_fargate_inventory_once(cli)
+
+    def test_compute_bracket_retries_inventory_race(self):
+        inventory_a = {
+            "fargateOnDemand": {"observedVcpu": 0, "tasks": []},
+            "ec2StandardOnDemand": {"observedVcpu": 0, "instances": []},
+        }
+        inventory_b = {
+            "fargateOnDemand": {"observedVcpu": 1, "tasks": [{"taskArn": "new"}]},
+            "ec2StandardOnDemand": {"observedVcpu": 0, "instances": []},
+        }
+        stable_usage = {"telemetryComplete": True, "maximumObservedVcpu": 0}
+        sequence = [inventory_a, inventory_b, inventory_b, inventory_b]
+        with mock.patch.object(
+            p1, "_compute_inventory_once", side_effect=sequence
+        ), mock.patch.object(p1, "collect_recent_vcpu_usage", return_value=stable_usage):
+            result = p1.collect_bracketed_compute_snapshot(object(), max_attempts=2)
+        self.assertTrue(result["computeVcpuInventory"]["verification"]["stable"])
+        self.assertEqual(result["computeVcpuInventory"]["verification"]["attemptsUsed"], 2)
+        self.assertEqual(
+            result["computeVcpuInventory"]["fargateOnDemand"]["observedVcpu"], 1
+        )
+
+    def test_compute_bracket_refuses_persistent_race(self):
+        counter = {"n": 0}
+
+        def changing(_cli):
+            counter["n"] += 1
+            return {
+                "fargateOnDemand": {"observedVcpu": counter["n"], "tasks": []},
+                "ec2StandardOnDemand": {"observedVcpu": 0, "instances": []},
+            }
+
+        stable_usage = {"telemetryComplete": True, "maximumObservedVcpu": 0}
+        with mock.patch.object(
+            p1, "_compute_inventory_once", side_effect=changing
+        ), mock.patch.object(p1, "collect_recent_vcpu_usage", return_value=stable_usage):
+            with self.assertRaises(p1.AdmissionError):
+                p1.collect_bracketed_compute_snapshot(object(), max_attempts=2)
+
+
+class ExpressProbeTests(unittest.TestCase):
+    def _probe_with_stderr(self, stderr):
+        cli = p1.AwsCli("aws", None, p1.REGION)
+        with mock.patch.object(
+            cli,
+            "_run",
+            return_value=CompletedProcess(["aws"], 255, "", stderr),
+        ):
+            return cli.probe_express_gateway_service("123456789012")
+
+    def test_resource_not_found_proves_api_recognized(self):
+        result = self._probe_with_stderr("ResourceNotFoundException: resource not found")
+        self.assertTrue(result["regionalApiRecognized"])
+
+    def test_unsupported_feature_is_red(self):
+        result = self._probe_with_stderr("UnsupportedFeatureException: not available")
+        self.assertFalse(result["regionalApiRecognized"])
+
+    def test_access_denied_fails_collection(self):
+        cli = p1.AwsCli("aws", None, p1.REGION)
+        with mock.patch.object(
+            cli,
+            "_run",
+            return_value=CompletedProcess(["aws"], 255, "", "AccessDeniedException"),
+        ):
+            with self.assertRaises(p1.AdmissionError):
+                cli.probe_express_gateway_service("123456789012")
+
+
+class QuotaTests(unittest.TestCase):
+    def test_applied_overrides_default_by_code(self):
+        cli = FakeCli(
+            {
+                ("service-quotas", "list-service-quotas"): {
+                    "Quotas": [
+                        {
+                            "QuotaCode": "L-1",
+                            "QuotaName": "Security groups per VPC",
+                            "Value": 2500,
+                        }
+                    ]
+                },
+                ("service-quotas", "list-aws-default-service-quotas"): {
+                    "Quotas": [
+                        {
+                            "QuotaCode": "L-1",
+                            "QuotaName": "Security groups per VPC",
+                            "Value": 5,
+                        }
+                    ]
+                },
+            }
+        )
+        result = p1.service_quotas(cli, "vpc")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["Value"], 2500)
+        self.assertEqual(result[0]["fpllmValueSource"], "applied")
+
+
+class LambdaSnapshotTests(unittest.TestCase):
+    def test_two_identical_bracketed_samples_pass(self):
+        account = {
+            "AccountLimit": {
+                "ConcurrentExecutions": 1000,
+                "UnreservedConcurrentExecutions": 1000,
+            }
+        }
+        allocations = {
+            "functions": [],
+            "functionCount": 0,
+            "totalReservedConcurrency": 0,
+            "totalProvisionedConcurrency": 0,
+            "provisionedConcurrencyNotCoveredByReserved": 0,
+        }
+        cli = FakeCli(
+            {("lambda", "get-account-settings"): [account, account, account, account]}
+        )
+        with mock.patch.object(
+            p1, "collect_lambda_concurrency_allocations", return_value=allocations
+        ):
+            result = p1.collect_stable_lambda_concurrency_snapshot(cli, max_attempts=2)
+        self.assertTrue(result["verification"]["stable"])
+        self.assertEqual(result["verification"]["attemptsUsed"], 2)
+
+    def test_changed_allocations_do_not_false_pass(self):
+        account = {
+            "AccountLimit": {
+                "ConcurrentExecutions": 1000,
+                "UnreservedConcurrentExecutions": 1000,
+            }
+        }
+        cli = FakeCli({("lambda", "get-account-settings"): [account] * 6})
+        allocations = [
+            {
+                "functions": [{"functionName": "a"}],
+                "functionCount": 1,
+                "totalReservedConcurrency": 0,
+                "totalProvisionedConcurrency": 0,
+                "provisionedConcurrencyNotCoveredByReserved": 0,
+            },
+            {
+                "functions": [{"functionName": "a", "provisionedConcurrencyClaim": 2}],
+                "functionCount": 1,
+                "totalReservedConcurrency": 0,
+                "totalProvisionedConcurrency": 2,
+                "provisionedConcurrencyNotCoveredByReserved": 2,
+            },
+            {
+                "functions": [{"functionName": "a", "provisionedConcurrencyClaim": 3}],
+                "functionCount": 1,
+                "totalReservedConcurrency": 0,
+                "totalProvisionedConcurrency": 3,
+                "provisionedConcurrencyNotCoveredByReserved": 3,
+            },
+        ]
+        with mock.patch.object(
+            p1, "collect_lambda_concurrency_allocations", side_effect=allocations
+        ):
+            with self.assertRaises(p1.AdmissionError):
+                p1.collect_stable_lambda_concurrency_snapshot(cli, max_attempts=3)
+
+
+class CodeBuildTests(unittest.TestCase):
+    def test_linux_curated_catalog_is_recognized(self):
+        result = p1.summarize_codebuild_environment_capability(
             {
                 "platforms": [
                     {
                         "platform": "AMAZON_LINUX",
                         "languages": [
                             {
-                                "language": "JAVA",
+                                "language": "STANDARD",
                                 "images": [
-                                    {
-                                        "name": "aws/codebuild/amazonlinux-x86_64-standard",
-                                        "description": "Linux image",
-                                        "versions": ["5.0", "6.0"],
-                                    }
+                                    {"name": "aws/codebuild/standard", "versions": ["7.0"]}
                                 ],
                             }
                         ],
-                    },
-                    {
-                        "platform": "WINDOWS_SERVER_2022",
-                        "languages": [],
-                    },
+                    }
                 ]
             }
         )
-        self.assertTrue(result["regionalApiReadSucceeded"])
-        self.assertEqual(result["environmentType"], "LINUX_CONTAINER")
-        self.assertEqual(result["computeType"], "BUILD_GENERAL1_LARGE")
         self.assertEqual(result["curatedLinuxDockerImageCount"], 1)
-        self.assertEqual(result["curatedLinuxImageVersionCount"], 2)
 
-    def test_codebuild_capability_parser_fails_on_malformed_linux_catalog(self) -> None:
-        with self.assertRaises(module.AdmissionError):
-            module.summarize_codebuild_environment_capability(
-                {"platforms": [{"platform": "AMAZON_LINUX"}]}
-            )
 
-    def test_rds_requires_iam_database_authentication(self) -> None:
-        observed = passing_observation()
-        observed["rdsOrderableOptions"][0]["SupportsIAMDatabaseAuthentication"] = False
-        checks, summary = self.evaluate(observed)
-        self.assertEqual(summary["status"], "FAIL")
-        self.assertIn(
-            "availability.rds-postgres-18.6-db.m8gd.large-gp3",
-            {check.id for check in checks if check.status == "FAIL"},
-        )
+class EvidenceEnvelopeTests(unittest.TestCase):
+    def _assert_envelope_consistent(self, path: Path):
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(envelope["kind"], "fpllm-controlled-evidence-envelope")
+        digest = p1.hashlib.sha256(p1.report_payload_bytes(envelope["report"])).hexdigest()
+        self.assertEqual(envelope["reportSha256"], digest)
+        self.assertFalse(path.with_name(f"{path.name}.sha256").exists())
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        return envelope
 
-    def test_kms_endpoint_is_optional(self) -> None:
-        observed = passing_observation()
-        observed["endpointServices"].remove("com.amazonaws.eu-west-1.kms")
-        _, normal = self.evaluate(observed, require_kms=False)
-        checks, required = self.evaluate(observed, require_kms=True)
-        self.assertEqual(normal["status"], "PASS")
-        self.assertEqual(required["status"], "FAIL")
-        self.assertIn(
-            "availability.vpc-endpoint-services",
-            {check.id for check in checks if check.status == "FAIL"},
-        )
+    def test_write_report_publishes_single_self_verifying_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "admission.json"
+            digest = p1.write_report(path, {"generation": 1})
+            envelope = self._assert_envelope_consistent(path)
+            self.assertEqual(envelope["reportSha256"], digest)
 
-    def test_dynamodb_on_demand_does_not_require_fake_account_throughput_quota(self) -> None:
-        checks, summary = self.evaluate(passing_observation())
-        self.assertEqual(summary["status"], "PASS")
-        self.assertIn(
-            "provider.dynamodb-on-demand-throughput-baseline",
-            {check.id for check in checks},
-        )
+    def test_interrupted_replace_preserves_previous_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "admission.json"
+            p1.write_report(path, {"generation": 1})
+            before = path.read_bytes()
+            with mock.patch.object(
+                p1.os, "replace", side_effect=OSError("simulated interruption")
+            ):
+                with self.assertRaises(OSError):
+                    p1.write_report(path, {"generation": 2})
+            self.assertEqual(path.read_bytes(), before)
+            self._assert_envelope_consistent(path)
+            self.assertFalse(list(path.parent.glob(f".{path.name}.tmp-*")))
 
-    def test_topology_rejects_unreviewed_private_subnets(self) -> None:
-        with self.assertRaises(module.AdmissionError):
-            module.evaluate(
-                passing_observation(),
-                ["10.42.16.0/28", "10.42.17.0/28"],
-                False,
-            )
+    def test_concurrent_writers_cannot_cross_pair_report_and_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "admission.json"
+            barrier = threading.Barrier(8)
 
-    def test_rds_connect_template_binds_account_region_and_user(self) -> None:
-        self.assertEqual(
-            module.rds_db_connect_resource_template("123456789012"),
-            "arn:aws:rds-db:eu-west-1:123456789012:dbuser:<DBI_RESOURCE_ID>/fpllm_incident_fence",
-        )
+            def writer(generation):
+                barrier.wait()
+                return p1.write_report(
+                    path, {"generation": generation, "payload": "x" * generation}
+                )
 
-    def test_rds_connect_policy_template_has_no_wildcard_authority(self) -> None:
-        policy = module.rds_db_connect_policy_template("123456789012")
-        self.assertEqual(policy["Statement"][0]["Action"], ["rds-db:connect"])
-        self.assertEqual(
-            policy["Statement"][0]["Resource"],
-            [
-                "arn:aws:rds-db:eu-west-1:123456789012:dbuser:<DBI_RESOURCE_ID>/fpllm_incident_fence"
-            ],
-        )
-        self.assertNotIn("*", module.json.dumps(policy, sort_keys=True))
-
-    def test_exact_quota_name_wins_over_partial_match(self) -> None:
-        values = [
-            quota("Reserved DB instances", 2),
-            quota("DB instances", 40),
-        ]
-        self.assertEqual(
-            module.quota_value(values, "DB instances", require_applied=True),
-            40.0,
-        )
-
-    def test_allowlist_contains_only_descriptive_operations(self) -> None:
-        forbidden = (
-            "create",
-            "delete",
-            "put",
-            "update",
-            "modify",
-            "run",
-            "start",
-            "stop",
-            "register",
-            "deregister",
-        )
-        for service, operation in module.READ_ONLY_AWS_OPERATIONS:
-            self.assertFalse(operation.startswith(forbidden), (service, operation))
-
-    def test_fixture_pass_is_never_resource_creation_authority(self) -> None:
-        boundary = module.build_evidence_boundary("fixture", "PASS")
-        self.assertFalse(boundary["liveAdmissionPassed"])
-        self.assertFalse(boundary["productionResourceCreationAuthorizedByThisReport"])
-
-    def test_live_pass_is_still_not_resource_creation_authority(self) -> None:
-        boundary = module.build_evidence_boundary("live-aws", "PASS")
-        self.assertTrue(boundary["liveAdmissionPassed"])
-        self.assertFalse(boundary["productionResourceCreationAuthorizedByThisReport"])
-
-    def test_write_report_is_owner_only_and_digest_matches(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "report.json"
-            digest = module.write_report(path, {"ok": True})
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-            digest_path = Path(f"{path}.sha256")
-            self.assertEqual(stat.S_IMODE(digest_path.stat().st_mode), 0o600)
-            self.assertTrue(digest_path.read_text(encoding="utf-8").startswith(digest))
-            self.assertEqual(digest, module.hashlib.sha256(path.read_bytes()).hexdigest())
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(writer, range(1, 9)))
+            envelope = self._assert_envelope_consistent(path)
+            self.assertIn(envelope["report"]["generation"], range(1, 9))
 
 
 if __name__ == "__main__":
