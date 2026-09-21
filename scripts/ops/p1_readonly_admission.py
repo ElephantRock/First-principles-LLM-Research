@@ -12,7 +12,9 @@ below before execution.
 
 import copy
 import importlib.util
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,13 @@ _CORE_COLLECT_EC2_STANDARD_INVENTORY_ONCE = _core.collect_ec2_standard_inventory
 _CORE_COLLECTOR_PROVENANCE = _core.collector_provenance
 _CORE_COLLECT_RECENT_VCPU_USAGE = _core.collect_recent_vcpu_usage
 _CORE_COLLECT_LAMBDA_CONCURRENCY_ALLOCATIONS = _core.collect_lambda_concurrency_allocations
+
+# A read-only observer cannot itself fence other account writers. Live admission therefore
+# requires an operator-established mutation-quiescence window and waits through the upper
+# end of AWS's documented backoff guidance before accepting the final compute bracket.
+COMPUTE_EVENTUAL_CONSISTENCY_GUARD_SECONDS = 300
+COMPUTE_MUTATION_QUIESCENCE_ENV = "FPLLM_P1_COMPUTE_MUTATION_QUIESCENCE"
+COMPUTE_MUTATION_QUIESCENCE_VALUE = "confirmed"
 
 
 class _CapacityReservationQuotaAccountingCli:
@@ -213,6 +222,10 @@ def _recent_vcpu_usage_hook(cli: Any, service: str, resource_class: str) -> dict
     return _CORE_COLLECT_RECENT_VCPU_USAGE(cli, service, resource_class)
 
 
+def _is_live_aws_cli(cli: Any) -> bool:
+    return isinstance(cli, _core.AwsCli)
+
+
 def collect_bracketed_compute_snapshot(
     cli: Any,
     account: str,
@@ -220,10 +233,36 @@ def collect_bracketed_compute_snapshot(
 ) -> dict[str, Any]:
     if max_attempts < 1:
         raise AdmissionError("compute snapshot requires at least one attempt")
+
+    live_guard = _is_live_aws_cli(cli)
+    guard_fingerprint: str | None = None
+    guard_started_at: str | None = None
+    guard_completed_at: str | None = None
+    if live_guard:
+        if os.environ.get(COMPUTE_MUTATION_QUIESCENCE_ENV) != COMPUTE_MUTATION_QUIESCENCE_VALUE:
+            raise AdmissionError(
+                "live compute admission requires an operator-established mutation-quiescence "
+                f"window; set {COMPUTE_MUTATION_QUIESCENCE_ENV}="
+                f"{COMPUTE_MUTATION_QUIESCENCE_VALUE!r} only after relevant EC2/ECS writers "
+                "are quiesced"
+            )
+        guard_started_at = _core.utc_now()
+        guard_inventory = _compute_inventory_once(cli, account)
+        guard_fingerprint = _core._fingerprint(guard_inventory)
+        time.sleep(COMPUTE_EVENTUAL_CONSISTENCY_GUARD_SECONDS)
+        guard_completed_at = _core.utc_now()
+
     last_reason = "no attempts executed"
-    for attempt in range(1, max_attempts + 1):
+    effective_max_attempts = 1 if live_guard else max_attempts
+    for attempt in range(1, effective_max_attempts + 1):
         try:
             before = _compute_inventory_once(cli, account)
+            before_fingerprint = _core._fingerprint(before)
+            if live_guard and before_fingerprint != guard_fingerprint:
+                raise AdmissionError(
+                    "direct compute inventory changed across the eventual-consistency guard; "
+                    "re-establish mutation quiescence and rerun the admission collector"
+                )
             usage = {
                 "fargateOnDemand": _core.collect_recent_vcpu_usage(
                     cli, "Fargate", "Standard/OnDemand"
@@ -234,34 +273,59 @@ def collect_bracketed_compute_snapshot(
             }
             after = _compute_inventory_once(cli, account)
         except AdmissionError as exc:
+            if live_guard:
+                raise
             last_reason = str(exc)
             continue
 
-        before_fingerprint = _core._fingerprint(before)
         after_fingerprint = _core._fingerprint(after)
         if before_fingerprint == after_fingerprint:
+            verification: dict[str, Any] = {
+                "stable": True,
+                "method": (
+                    "mutation-quiescence-guard-then-direct-quota-inventory-before-and-after-"
+                    "cloudwatch-window-read"
+                    if live_guard
+                    else "direct-quota-inventory-before-and-after-cloudwatch-window-read"
+                ),
+                "attemptsUsed": attempt,
+                "maxAttempts": effective_max_attempts,
+                "inventoryFingerprintSha256": after_fingerprint,
+                "eventualConsistencyGuardApplied": live_guard,
+            }
+            if live_guard:
+                verification.update(
+                    {
+                        "eventualConsistencyGuardSeconds": (
+                            COMPUTE_EVENTUAL_CONSISTENCY_GUARD_SECONDS
+                        ),
+                        "guardStartInventoryFingerprintSha256": guard_fingerprint,
+                        "guardStartedAt": guard_started_at,
+                        "guardCompletedAt": guard_completed_at,
+                        "mutationQuiescenceRequired": True,
+                        "mutationQuiescenceAssertion": COMPUTE_MUTATION_QUIESCENCE_VALUE,
+                        "mutationQuiescenceAssertionSource": COMPUTE_MUTATION_QUIESCENCE_ENV,
+                    }
+                )
             return {
                 "vcpuUsage": usage,
                 "computeVcpuInventory": {
                     **after,
-                    "verification": {
-                        "stable": True,
-                        "method": (
-                            "direct-quota-inventory-before-and-after-cloudwatch-window-read"
-                        ),
-                        "attemptsUsed": attempt,
-                        "maxAttempts": max_attempts,
-                        "inventoryFingerprintSha256": after_fingerprint,
-                    },
+                    "verification": verification,
                 },
             }
         last_reason = (
             "direct EC2/Fargate quota inventory changed across the CloudWatch usage reads"
         )
+        if live_guard:
+            raise AdmissionError(
+                f"{last_reason}; mutation quiescence was not preserved, so live admission "
+                "must be rerun from a new guard window"
+            )
 
     raise AdmissionError(
         "compute vCPU inventory did not stabilize within "
-        f"{max_attempts} attempts: {last_reason}"
+        f"{effective_max_attempts} attempts: {last_reason}"
     )
 
 
