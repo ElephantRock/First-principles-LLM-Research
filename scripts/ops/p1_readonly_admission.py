@@ -30,6 +30,7 @@ MIN_ENI_HEADROOM = 32
 MIN_PRIVATE_CONTROL_USABLE_IPV4 = 32
 MIN_RDS_MANUAL_SNAPSHOT_HEADROOM = 2
 VCU_USAGE_WINDOW_MINUTES = 15
+LAMBDA_SNAPSHOT_MAX_ATTEMPTS = 3
 
 # Frozen provider/hard-limit values recorded by the P0 decision chain.
 CODEBUILD_VPC_SECURITY_GROUP_LIMIT = 5
@@ -579,12 +580,30 @@ class AwsCli:
             return {"cliCommandAvailable": True, "regionalApiRecognized": True, "probeOutcome": "success"}
         if "invalid choice" in lowered or "unknown options" in lowered:
             return {"cliCommandAvailable": False, "regionalApiRecognized": False, "probeOutcome": "cli-model-missing"}
-        recognized = any(marker in lowered for marker in ("servicenotfoundexception", "service not found", "cluster not found", "clusternotfoundexception"))
+        recognized = any(
+            marker in lowered
+            for marker in (
+                "resourcenotfoundexception",
+                "resource not found",
+                "servicenotfoundexception",
+                "service not found",
+                "clusternotfoundexception",
+                "cluster not found",
+            )
+        )
         if recognized:
             return {"cliCommandAvailable": True, "regionalApiRecognized": True, "probeOutcome": "expected-not-found"}
         if "accessdenied" in lowered or "access denied" in lowered:
             raise AdmissionError("read-only identity cannot call ecs:DescribeExpressGatewayService")
-        if any(marker in lowered for marker in ("unknownoperation", "unsupportedoperation", "not supported in this region")):
+        if any(
+            marker in lowered
+            for marker in (
+                "unsupportedfeatureexception",
+                "unknownoperation",
+                "unsupportedoperation",
+                "not supported in this region",
+            )
+        ):
             return {"cliCommandAvailable": True, "regionalApiRecognized": False, "probeOutcome": "regional-api-unsupported"}
         raise AdmissionError(f"ECS Express regional read probe returned an unclassified error: {combined[-1200:]}")
 
@@ -674,16 +693,21 @@ def collect_lambda_concurrency_allocations(cli: AwsCli) -> dict[str, Any]:
     if not isinstance(functions, list):
         raise AdmissionError("lambda list-functions response is missing Functions")
 
+    normalized_functions: list[dict[str, Any]] = []
+    for function in functions:
+        name = function.get("FunctionName")
+        if not isinstance(name, str) or not name:
+            raise AdmissionError(f"lambda function inventory contains invalid FunctionName: {name!r}")
+        normalized_functions.append(function)
+    normalized_functions.sort(key=lambda item: str(item["FunctionName"]))
+
     records: list[dict[str, Any]] = []
     total_reserved = 0
     total_provisioned = 0
     provisioned_not_covered = 0
 
-    for function in functions:
-        name = function.get("FunctionName")
-        if not isinstance(name, str) or not name:
-            raise AdmissionError(f"lambda function inventory contains invalid FunctionName: {name!r}")
-
+    for function in normalized_functions:
+        name = str(function["FunctionName"])
         concurrency_doc = cli.run_json("lambda", "get-function-concurrency", "--function-name", name)
         reserved_value = concurrency_doc.get("ReservedConcurrentExecutions", 0)
         if not isinstance(reserved_value, (int, float)) or int(reserved_value) < 0:
@@ -724,6 +748,7 @@ def collect_lambda_concurrency_allocations(cli: AwsCli) -> dict[str, Any]:
                     "status": config.get("Status"),
                 }
             )
+        config_records.sort(key=lambda item: str(item.get("functionArn") or ""))
 
         if reserved > 0 and function_provisioned_claim > reserved:
             raise AdmissionError(
@@ -752,6 +777,72 @@ def collect_lambda_concurrency_allocations(cli: AwsCli) -> dict[str, Any]:
         "totalProvisionedConcurrency": total_provisioned,
         "provisionedConcurrencyNotCoveredByReserved": provisioned_not_covered,
     }
+
+
+def lambda_account_concurrency_view(settings: dict[str, Any]) -> dict[str, int]:
+    account_limit = settings.get("AccountLimit")
+    if not isinstance(account_limit, dict):
+        raise AdmissionError("lambda get-account-settings response is missing AccountLimit")
+    view: dict[str, int] = {}
+    for field in ("ConcurrentExecutions", "UnreservedConcurrentExecutions"):
+        raw = account_limit.get(field)
+        if not isinstance(raw, (int, float)) or int(raw) < 0:
+            raise AdmissionError(f"invalid Lambda account concurrency field {field}: {raw!r}")
+        view[field] = int(raw)
+    return view
+
+
+def collect_stable_lambda_concurrency_snapshot(
+    cli: AwsCli,
+    max_attempts: int = LAMBDA_SNAPSHOT_MAX_ATTEMPTS,
+) -> dict[str, Any]:
+    if max_attempts < 2:
+        raise AdmissionError("Lambda concurrency snapshot requires at least two attempts")
+
+    previous_fingerprint: str | None = None
+    last_reason = "no samples collected"
+    for attempt in range(1, max_attempts + 1):
+        account_before = cli.run_json("lambda", "get-account-settings")
+        before_view = lambda_account_concurrency_view(account_before)
+        allocations = collect_lambda_concurrency_allocations(cli)
+        account_after = cli.run_json("lambda", "get-account-settings")
+        after_view = lambda_account_concurrency_view(account_after)
+
+        if before_view != after_view:
+            previous_fingerprint = None
+            last_reason = (
+                "account concurrency changed while the function/provisioned inventory was being read"
+            )
+            continue
+
+        fingerprint = json.dumps(
+            {"accountConcurrency": after_view, "allocations": allocations},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if previous_fingerprint == fingerprint:
+            return {
+                "accountSettings": account_after,
+                "allocations": allocations,
+                "verification": {
+                    "stable": True,
+                    "method": "two-consecutive-bracketed-identical-snapshots",
+                    "attemptsUsed": attempt,
+                    "maxAttempts": max_attempts,
+                    "accountConcurrency": after_view,
+                    "inventoryFingerprintSha256": hashlib.sha256(
+                        fingerprint.encode("utf-8")
+                    ).hexdigest(),
+                },
+            }
+
+        previous_fingerprint = fingerprint
+        last_reason = "consecutive bracketed Lambda allocation snapshots were not identical"
+
+    raise AdmissionError(
+        "Lambda concurrency inventory did not stabilize within "
+        f"{max_attempts} attempts: {last_reason}"
+    )
 
 
 def collector_provenance(require_clean: bool) -> dict[str, Any]:
@@ -813,8 +904,9 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
     tables = cli.run_json("dynamodb", "list-tables")
     rds_instances = cli.run_json("rds", "describe-db-instances")
     rds_snapshots = cli.run_json("rds", "describe-db-snapshots", "--snapshot-type", "manual")
-    lambda_settings = cli.run_json("lambda", "get-account-settings")
-    lambda_allocations = collect_lambda_concurrency_allocations(cli)
+    lambda_snapshot = collect_stable_lambda_concurrency_snapshot(cli)
+    lambda_settings = lambda_snapshot["accountSettings"]
+    lambda_allocations = lambda_snapshot["allocations"]
 
     rds_instance_list = rds_instances.get("DBInstances") or []
     rds_committed_storage = sum(
@@ -851,6 +943,7 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
         },
         "lambdaAccountSettings": lambda_settings,
         "lambdaConcurrencyAllocations": lambda_allocations,
+        "lambdaConcurrencySnapshotVerification": lambda_snapshot["verification"],
     }
 
 
