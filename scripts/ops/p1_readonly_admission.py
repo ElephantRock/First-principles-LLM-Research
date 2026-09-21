@@ -69,6 +69,7 @@ READ_ONLY_AWS_OPERATIONS = {
     ("ec2", "describe-instances"),
     ("ec2", "describe-vpcs"),
     ("ec2", "describe-network-interfaces"),
+    ("ec2", "describe-security-groups"),
     ("ec2", "describe-vpc-endpoints"),
     ("ec2", "describe-vpc-endpoint-services"),
     ("elbv2", "describe-load-balancers"),
@@ -405,13 +406,15 @@ def evaluate(
         "Reviewed P1 topology uses six subnets.",
     )
 
-    sg_quota = applied("vpc", "Security groups per VPC")
+    sg_quota = applied("vpc", "VPC security groups per Region")
+    sg_count = int(usage.get("securityGroups", -1))
+    sg_free = sg_quota - sg_count if sg_count >= 0 else None
     add(
-        "quota.security-groups-per-vpc",
-        sg_quota >= MIN_SECURITY_GROUP_HEADROOM,
-        {"appliedQuotaPerVpc": sg_quota, "plannedNewVpc": True},
-        f">= {MIN_SECURITY_GROUP_HEADROOM} security groups per VPC",
-        "AWS exposes this limit per VPC. The production VPC is new, so regional SG inventory is not subtracted from this per-VPC quota.",
+        "quota.security-group-headroom",
+        sg_free is not None and sg_free >= MIN_SECURITY_GROUP_HEADROOM,
+        {"quota": sg_quota, "current": sg_count, "free": sg_free},
+        f">= {MIN_SECURITY_GROUP_HEADROOM} free regional security groups",
+        "AWS documents VPC security groups as a regional account quota; current regional security groups are subtracted before the conservative P1 margin is accepted.",
     )
 
     eni_quota = applied("vpc", "Network interfaces per Region")
@@ -1588,6 +1591,7 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
     )
     vpcs = cli.run_json("ec2", "describe-vpcs")
     enis = cli.run_json("ec2", "describe-network-interfaces")
+    sgs = cli.run_json("ec2", "describe-security-groups")
     endpoints = cli.run_json("ec2", "describe-vpc-endpoints")
     albs = cli.run_json("elbv2", "describe-load-balancers")
     projects = cli.run_json("codebuild", "list-projects")
@@ -1633,6 +1637,7 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
         "usage": {
             "vpcs": count_list(vpcs, "Vpcs"),
             "networkInterfaces": count_list(enis, "NetworkInterfaces"),
+            "securityGroups": count_list(sgs, "SecurityGroups"),
             "gatewayVpcEndpoints": sum(
                 1
                 for item in (endpoints.get("VpcEndpoints") or [])
