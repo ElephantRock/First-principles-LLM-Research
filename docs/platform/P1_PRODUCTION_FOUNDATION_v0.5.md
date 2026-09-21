@@ -125,7 +125,7 @@ The stable entry point loads the reviewed implementation core from:
 scripts/ops/p1_readonly_admission_core.py
 ```
 
-The split is deliberate. The core retains the reviewed fail-closed collector while the small entry point contains the final provider-accounting correction for future-dated EC2 Capacity Reservation commitments. Live evidence provenance binds **both** files to the same Git revision and records a SHA-256 and tracked-working-tree cleanliness result for each. A live run fails if either tracked collector file differs from the committed checkout.
+The split is deliberate. The core retains the reviewed fail-closed collector while the small entry point contains the final provider-accounting corrections for future-dated EC2 Capacity Reservation commitments and exclusion of `InstanceLifecycle=capacity-block` instances from Standard On-Demand vCPU usage. Live evidence provenance binds **both** files to the same Git revision and records a SHA-256 and tracked-working-tree cleanliness result for each. A live run fails if either tracked collector file differs from the committed checkout.
 
 Example execution under a short-lived read-only/federated AWS identity:
 
