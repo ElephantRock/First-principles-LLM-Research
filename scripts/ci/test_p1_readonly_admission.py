@@ -554,7 +554,7 @@ class ComputeInventoryTests(unittest.TestCase):
         sequence = [inventory_a, inventory_b, inventory_b, inventory_b]
         with mock.patch.object(
             p1, "_compute_inventory_once", side_effect=sequence
-        ), mock.patch.object(p1._core, "collect_recent_vcpu_usage", return_value=stable_usage):
+        ), mock.patch.object(p1, "collect_recent_vcpu_usage", return_value=stable_usage):
             result = p1.collect_bracketed_compute_snapshot(object(), ACCOUNT, max_attempts=2)
         self.assertTrue(result["computeVcpuInventory"]["verification"]["stable"])
         self.assertEqual(result["computeVcpuInventory"]["verification"]["attemptsUsed"], 2)
@@ -575,7 +575,7 @@ class ComputeInventoryTests(unittest.TestCase):
         stable_usage = {"telemetryComplete": True, "maximumObservedVcpu": 0}
         with mock.patch.object(
             p1, "_compute_inventory_once", side_effect=changing
-        ), mock.patch.object(p1._core, "collect_recent_vcpu_usage", return_value=stable_usage):
+        ), mock.patch.object(p1, "collect_recent_vcpu_usage", return_value=stable_usage):
             with self.assertRaises(p1.AdmissionError):
                 p1.collect_bracketed_compute_snapshot(object(), ACCOUNT, max_attempts=2)
 
@@ -658,7 +658,7 @@ class LambdaSnapshotTests(unittest.TestCase):
             {("lambda", "get-account-settings"): [account, account, account, account]}
         )
         with mock.patch.object(
-            p1._core, "collect_lambda_concurrency_allocations", return_value=allocations
+            p1, "collect_lambda_concurrency_allocations", return_value=allocations
         ):
             result = p1.collect_stable_lambda_concurrency_snapshot(cli, max_attempts=2)
         self.assertTrue(result["verification"]["stable"])
@@ -696,7 +696,7 @@ class LambdaSnapshotTests(unittest.TestCase):
             },
         ]
         with mock.patch.object(
-            p1._core, "collect_lambda_concurrency_allocations", side_effect=allocations
+            p1, "collect_lambda_concurrency_allocations", side_effect=allocations
         ):
             with self.assertRaises(p1.AdmissionError):
                 p1.collect_stable_lambda_concurrency_snapshot(cli, max_attempts=3)
