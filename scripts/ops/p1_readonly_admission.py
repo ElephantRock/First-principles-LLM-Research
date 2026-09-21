@@ -55,9 +55,23 @@ DYNAMODB_ON_DEMAND_TABLE_READ_WRITE_DEFAULT = 40000
 
 # The AWS Standard On-Demand vCPU quota is the A/C/D/H/I/M/R/T/Z family bucket.
 EC2_STANDARD_ONDEMAND_FAMILY_INITIALS = frozenset("acdhimrtz")
-ACTIVE_EC2_STATES = frozenset({"pending", "running"})
+# AWS documents only running instances as consuming On-Demand Instance vCPU quotas.
+COUNTED_EC2_INSTANCE_STATES = frozenset({"running"})
+# AWS documents these Capacity Reservation states as consuming the owner's On-Demand quota.
+COUNTED_CAPACITY_RESERVATION_STATES = frozenset(
+    {"assessing", "scheduled", "pending", "active", "delayed"}
+)
+# Any non-terminal ECS task state can still represent Fargate capacity in use.
 ACTIVE_ECS_LAST_STATUSES = frozenset(
-    {"PROVISIONING", "PENDING", "ACTIVATING", "RUNNING", "DEACTIVATING"}
+    {
+        "PROVISIONING",
+        "PENDING",
+        "ACTIVATING",
+        "RUNNING",
+        "DEACTIVATING",
+        "STOPPING",
+        "DEPROVISIONING",
+    }
 )
 
 READ_ONLY_AWS_OPERATIONS = {
@@ -67,6 +81,7 @@ READ_ONLY_AWS_OPERATIONS = {
     ("ec2", "describe-instance-type-offerings"),
     ("ec2", "describe-instance-types"),
     ("ec2", "describe-instances"),
+    ("ec2", "describe-capacity-reservations"),
     ("ec2", "describe-vpcs"),
     ("ec2", "describe-network-interfaces"),
     ("ec2", "describe-security-groups"),
@@ -373,8 +388,8 @@ def evaluate(
             "inventory": ec2_inventory,
             "snapshotVerification": compute_verification,
         },
-        ">= 4 free Standard On-Demand vCPU after max(recent AWS/Usage, bracketed direct EC2 inventory)",
-        "Admission requires both fresh telemetry and a stable read-only inventory bracket; launches newer than the metric are included by the post-metric inventory or the collection fails closed as raced.",
+        ">= 4 free Standard On-Demand vCPU after max(recent AWS/Usage, bracketed direct EC2 quota inventory)",
+        "Direct EC2 quota inventory includes running Standard On-Demand instances plus owner Capacity Reservations that AWS counts against the same quota, avoiding a metric-lag false pass after either kind of quota-consuming change.",
     )
 
     alb_quota = applied("elasticloadbalancing", "Application Load Balancers per Region")
@@ -1009,43 +1024,114 @@ def _standard_ec2_family(instance_type: str) -> bool:
     return bool(family) and family[0] in EC2_STANDARD_ONDEMAND_FAMILY_INITIALS
 
 
-def collect_ec2_standard_inventory_once(cli: AwsCli) -> dict[str, Any]:
-    doc = cli.run_json(
+def collect_ec2_standard_inventory_once(cli: AwsCli, account: str) -> dict[str, Any]:
+    if not re.fullmatch(r"\d{12}", account):
+        raise AdmissionError(f"invalid AWS account for EC2 quota inventory: {account!r}")
+
+    capacity_doc = cli.run_json(
+        "ec2",
+        "describe-capacity-reservations",
+        "--filters",
+        f"Name=owner-id,Values={account}",
+    )
+    capacity_items = capacity_doc.get("CapacityReservations")
+    if not isinstance(capacity_items, list):
+        raise AdmissionError(
+            "EC2 describe-capacity-reservations response is missing CapacityReservations"
+        )
+
+    quota_reservations: list[dict[str, Any]] = []
+    counted_reservation_ids: set[str] = set()
+    instance_types: set[str] = set()
+    for reservation in capacity_items:
+        if not isinstance(reservation, dict):
+            raise AdmissionError(f"invalid EC2 Capacity Reservation record: {reservation!r}")
+        state = reservation.get("State")
+        if state not in COUNTED_CAPACITY_RESERVATION_STATES:
+            continue
+        reservation_id = reservation.get("CapacityReservationId")
+        owner_id = reservation.get("OwnerId")
+        instance_type = reservation.get("InstanceType")
+        total = reservation.get("TotalInstanceCount")
+        available = reservation.get("AvailableInstanceCount")
+        if owner_id != account:
+            raise AdmissionError(
+                f"owner-filtered Capacity Reservation has unexpected owner: {reservation!r}"
+            )
+        if (
+            not isinstance(reservation_id, str)
+            or not reservation_id
+            or not isinstance(instance_type, str)
+            or not instance_type
+            or not isinstance(total, int)
+            or total < 0
+            or not isinstance(available, int)
+            or available < 0
+            or available > total
+        ):
+            raise AdmissionError(f"invalid quota-counting Capacity Reservation: {reservation!r}")
+        if reservation.get("ReservationType", "default") == "capacity-block":
+            continue
+        if not _standard_ec2_family(instance_type):
+            continue
+        counted_reservation_ids.add(reservation_id)
+        instance_types.add(instance_type)
+        quota_reservations.append(
+            {
+                "capacityReservationId": reservation_id,
+                "state": state,
+                "instanceType": instance_type,
+                "totalInstanceCount": total,
+                "availableInstanceCount": available,
+                "tenancy": reservation.get("Tenancy"),
+            }
+        )
+
+    instances_doc = cli.run_json(
         "ec2",
         "describe-instances",
         "--filters",
-        "Name=instance-state-name,Values=pending,running",
+        "Name=instance-state-name,Values=running",
     )
-    reservations = doc.get("Reservations")
+    reservations = instances_doc.get("Reservations")
     if not isinstance(reservations, list):
         raise AdmissionError("EC2 describe-instances response is missing Reservations")
 
     candidates: list[dict[str, Any]] = []
-    instance_types: set[str] = set()
-    for reservation in reservations:
-        if not isinstance(reservation, dict) or not isinstance(reservation.get("Instances"), list):
-            raise AdmissionError(f"invalid EC2 reservation record: {reservation!r}")
-        for instance in reservation["Instances"]:
+    for launch_reservation in reservations:
+        if (
+            not isinstance(launch_reservation, dict)
+            or not isinstance(launch_reservation.get("Instances"), list)
+        ):
+            raise AdmissionError(f"invalid EC2 reservation record: {launch_reservation!r}")
+        for instance in launch_reservation["Instances"]:
             if not isinstance(instance, dict):
                 raise AdmissionError(f"invalid EC2 instance record: {instance!r}")
             instance_id = instance.get("InstanceId")
             instance_type = instance.get("InstanceType")
             state = (instance.get("State") or {}).get("Name")
             lifecycle = instance.get("InstanceLifecycle")
-            if state not in ACTIVE_EC2_STATES:
+            if state not in COUNTED_EC2_INSTANCE_STATES:
                 continue
             if lifecycle == "spot":
                 continue
             if not isinstance(instance_id, str) or not isinstance(instance_type, str):
-                raise AdmissionError(f"active EC2 instance missing identity/type: {instance!r}")
+                raise AdmissionError(f"running EC2 instance missing identity/type: {instance!r}")
             if not _standard_ec2_family(instance_type):
                 continue
+            capacity_reservation_id = instance.get("CapacityReservationId")
+            covered_by_owned_reservation = (
+                isinstance(capacity_reservation_id, str)
+                and capacity_reservation_id in counted_reservation_ids
+            )
             candidates.append(
                 {
                     "instanceId": instance_id,
                     "instanceType": instance_type,
                     "state": state,
                     "lifecycle": lifecycle or "on-demand",
+                    "capacityReservationId": capacity_reservation_id,
+                    "coveredByOwnedQuotaCountingCapacityReservation": covered_by_owned_reservation,
                 }
             )
             instance_types.add(instance_type)
@@ -1061,26 +1147,52 @@ def collect_ec2_standard_inventory_once(cli: AwsCli) -> dict[str, Any]:
         for entry in entries:
             instance_type = entry.get("InstanceType")
             vcpus = (entry.get("VCpuInfo") or {}).get("DefaultVCpus")
-            if not isinstance(instance_type, str) or not isinstance(vcpus, (int, float)) or int(vcpus) <= 0:
+            if (
+                not isinstance(instance_type, str)
+                or not isinstance(vcpus, (int, float))
+                or int(vcpus) <= 0
+            ):
                 raise AdmissionError(f"invalid EC2 instance-type vCPU record: {entry!r}")
             vcpu_by_type[instance_type] = int(vcpus)
     missing = sorted(instance_types - set(vcpu_by_type))
     if missing:
         raise AdmissionError(f"EC2 vCPU inventory missing instance types: {missing}")
 
-    records: list[dict[str, Any]] = []
-    observed_vcpu = 0
+    reservation_records: list[dict[str, Any]] = []
+    reservation_vcpu = 0
+    for reservation in quota_reservations:
+        vcpus = vcpu_by_type[reservation["instanceType"]]
+        reserved_vcpu = reservation["totalInstanceCount"] * vcpus
+        reservation_vcpu += reserved_vcpu
+        reservation_records.append(
+            {**reservation, "vcpusPerInstance": vcpus, "reservedVcpu": reserved_vcpu}
+        )
+    reservation_records.sort(key=lambda item: item["capacityReservationId"])
+
+    instance_records: list[dict[str, Any]] = []
+    running_vcpu = 0
+    running_outside_owned_reservations_vcpu = 0
     for candidate in candidates:
         vcpus = vcpu_by_type[candidate["instanceType"]]
-        observed_vcpu += vcpus
-        records.append({**candidate, "vcpus": vcpus})
-    records.sort(key=lambda item: item["instanceId"])
+        running_vcpu += vcpus
+        if not candidate["coveredByOwnedQuotaCountingCapacityReservation"]:
+            running_outside_owned_reservations_vcpu += vcpus
+        instance_records.append({**candidate, "vcpus": vcpus})
+    instance_records.sort(key=lambda item: item["instanceId"])
+
+    observed_vcpu = reservation_vcpu + running_outside_owned_reservations_vcpu
     return {
         "observedVcpu": observed_vcpu,
-        "instanceCount": len(records),
-        "instances": records,
+        "runningInstanceVcpu": running_vcpu,
+        "runningOutsideOwnedCapacityReservationsVcpu": running_outside_owned_reservations_vcpu,
+        "ownedCapacityReservationVcpu": reservation_vcpu,
+        "instanceCount": len(instance_records),
+        "instances": instance_records,
+        "capacityReservationCount": len(reservation_records),
+        "capacityReservations": reservation_records,
         "quotaClass": "Standard/OnDemand",
         "familyInitials": sorted(EC2_STANDARD_ONDEMAND_FAMILY_INITIALS),
+        "capacityReservationQuotaStates": sorted(COUNTED_CAPACITY_RESERVATION_STATES),
     }
 
 
@@ -1103,7 +1215,11 @@ def _task_cpu_units(cli: AwsCli, task: dict[str, Any], cache: dict[str, int]) ->
                 f"ECS task-definition response missing taskDefinition: {definition_arn}"
             )
         definition_cpu = definition.get("cpu")
-        if not isinstance(definition_cpu, str) or not definition_cpu.isdigit() or int(definition_cpu) <= 0:
+        if (
+            not isinstance(definition_cpu, str)
+            or not definition_cpu.isdigit()
+            or int(definition_cpu) <= 0
+        ):
             raise AdmissionError(f"Fargate task definition has invalid cpu: {definition_arn}")
         cache[definition_arn] = int(definition_cpu)
     return cache[definition_arn]
@@ -1128,12 +1244,26 @@ def collect_fargate_inventory_once(cli: AwsCli) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     task_definition_cpu: dict[str, int] = {}
     for cluster_arn in sorted(cluster_arns):
-        tasks_doc = cli.run_json(
-            "ecs", "list-tasks", "--cluster", cluster_arn, "--desired-status", "RUNNING"
-        )
-        task_arns = tasks_doc.get("taskArns")
-        if not isinstance(task_arns, list) or any(not isinstance(item, str) for item in task_arns):
-            raise AdmissionError(f"ECS list-tasks returned invalid taskArns for {cluster_arn}")
+        task_arns: set[str] = set()
+        # A stopping task can already have desiredStatus=STOPPED while lastStatus remains
+        # RUNNING/STOPPING. Query both desired-status domains so direct inventory cannot
+        # drop quota-consuming shutdown work merely because stop was requested.
+        for desired_status in ("RUNNING", "STOPPED"):
+            tasks_doc = cli.run_json(
+                "ecs",
+                "list-tasks",
+                "--cluster",
+                cluster_arn,
+                "--desired-status",
+                desired_status,
+            )
+            listed = tasks_doc.get("taskArns")
+            if not isinstance(listed, list) or any(not isinstance(item, str) for item in listed):
+                raise AdmissionError(
+                    f"ECS list-tasks returned invalid taskArns for {cluster_arn}/{desired_status}"
+                )
+            task_arns.update(listed)
+
         for batch in _chunks(sorted(task_arns), 100):
             if not batch:
                 continue
@@ -1158,13 +1288,17 @@ def collect_fargate_inventory_once(cli: AwsCli) -> dict[str, Any]:
                 on_demand_fargate = capacity_provider == "FARGATE" or launch_type == "FARGATE"
                 if not on_demand_fargate:
                     continue
-                desired_status = task.get("desiredStatus")
                 last_status = task.get("lastStatus")
-                if desired_status != "RUNNING" or last_status not in ACTIVE_ECS_LAST_STATUSES:
+                if last_status not in ACTIVE_ECS_LAST_STATUSES:
                     continue
                 task_arn = task.get("taskArn")
+                desired_status = task.get("desiredStatus")
                 if not isinstance(task_arn, str):
                     raise AdmissionError(f"active Fargate task missing taskArn: {task!r}")
+                if desired_status not in {"RUNNING", "STOPPED"}:
+                    raise AdmissionError(
+                        f"active Fargate task has unexpected desiredStatus: {task!r}"
+                    )
                 cpu_units = _task_cpu_units(cli, task, task_definition_cpu)
                 records.append(
                     {
@@ -1186,13 +1320,15 @@ def collect_fargate_inventory_once(cli: AwsCli) -> dict[str, Any]:
         "tasks": records,
         "eksClusters": [],
         "quotaClass": "Standard/OnDemand",
+        "enumeratedDesiredStatuses": ["RUNNING", "STOPPED"],
+        "countedLastStatuses": sorted(ACTIVE_ECS_LAST_STATUSES),
     }
 
 
-def _compute_inventory_once(cli: AwsCli) -> dict[str, Any]:
+def _compute_inventory_once(cli: AwsCli, account: str) -> dict[str, Any]:
     return {
         "fargateOnDemand": collect_fargate_inventory_once(cli),
-        "ec2StandardOnDemand": collect_ec2_standard_inventory_once(cli),
+        "ec2StandardOnDemand": collect_ec2_standard_inventory_once(cli, account),
     }
 
 
@@ -1202,14 +1338,16 @@ def _fingerprint(value: Any) -> str:
 
 
 def collect_bracketed_compute_snapshot(
-    cli: AwsCli, max_attempts: int = COMPUTE_SNAPSHOT_MAX_ATTEMPTS
+    cli: AwsCli,
+    account: str,
+    max_attempts: int = COMPUTE_SNAPSHOT_MAX_ATTEMPTS,
 ) -> dict[str, Any]:
     if max_attempts < 1:
         raise AdmissionError("compute snapshot requires at least one attempt")
     last_reason = "no attempts executed"
     for attempt in range(1, max_attempts + 1):
         try:
-            before = _compute_inventory_once(cli)
+            before = _compute_inventory_once(cli, account)
             usage = {
                 "fargateOnDemand": collect_recent_vcpu_usage(
                     cli, "Fargate", "Standard/OnDemand"
@@ -1218,7 +1356,7 @@ def collect_bracketed_compute_snapshot(
                     cli, "EC2", "Standard/OnDemand"
                 ),
             }
-            after = _compute_inventory_once(cli)
+            after = _compute_inventory_once(cli, account)
         except AdmissionError as exc:
             last_reason = str(exc)
             continue
@@ -1231,14 +1369,14 @@ def collect_bracketed_compute_snapshot(
                     **after,
                     "verification": {
                         "stable": True,
-                        "method": "direct-inventory-before-and-after-cloudwatch-window-read",
+                        "method": "direct-quota-inventory-before-and-after-cloudwatch-window-read",
                         "attemptsUsed": attempt,
                         "maxAttempts": max_attempts,
                         "inventoryFingerprintSha256": after_fingerprint,
                     },
                 },
             }
-        last_reason = "direct EC2/Fargate inventory changed across the CloudWatch usage reads"
+        last_reason = "direct EC2/Fargate quota inventory changed across the CloudWatch usage reads"
     raise AdmissionError(
         "compute vCPU inventory did not stabilize within "
         f"{max_attempts} attempts: {last_reason}"
@@ -1585,7 +1723,7 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
     )
 
     express_probe = cli.probe_express_gateway_service(account)
-    compute_snapshot = collect_bracketed_compute_snapshot(cli)
+    compute_snapshot = collect_bracketed_compute_snapshot(cli, account)
     codebuild_environment_capability = summarize_codebuild_environment_capability(
         cli.run_json("codebuild", "list-curated-environment-images")
     )
@@ -1721,9 +1859,7 @@ def write_report(path: Path, report: dict[str, Any]) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     envelope, digest = evidence_envelope(report)
     payload = (json.dumps(envelope, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    temp = path.with_name(
-        f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
-    )
+    temp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as handle:
