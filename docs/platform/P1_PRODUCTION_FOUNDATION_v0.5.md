@@ -32,7 +32,7 @@ live no-create admission report is green
 
 The report is therefore a necessary admission input, not stand-alone authority to create resources.
 
-Repository CI validates the collector with fixtures only. CI is not production-account evidence and a fixture result can never be classified as a live admission pass.
+Repository CI validates the collector with fixtures and mocked read-only AWS responses only. CI is not production-account evidence and a fixture result can never be classified as a live admission pass.
 
 ---
 
@@ -143,7 +143,9 @@ For adjustable account quotas that can stop provisioning, the collector requires
 
 Fargate and Standard On-Demand EC2 admission is based on **remaining headroom**, not merely the nominal applied quota. The collector reads CloudWatch `AWS/Usage` `ResourceCount` for the quota-corresponding `vCPU` resource and retains the complete recent measurement window in controlled evidence.
 
-ECS Express capability is checked by a real read-only `DescribeExpressGatewayService` call against a deliberately nonexistent service ARN. A recognized service/cluster-not-found response proves that the regional API understands the operation; a local CLI command model alone is not accepted as regional evidence.
+ECS Express capability is checked by a real read-only `DescribeExpressGatewayService` call against a deliberately nonexistent service ARN. A documented `ResourceNotFoundException` or equivalent service/cluster-not-found response proves that the regional API recognizes the operation. A documented `UnsupportedFeatureException` is classified as regional unsupported. A local CLI command model alone is not accepted as regional evidence.
+
+Lambda concurrency collection is deliberately repeated rather than treated as one atomic API snapshot. Each attempt brackets the full function/reserved/provisioned inventory with `GetAccountSettings` before and after the inventory. The account concurrency fields must be unchanged across that bracket, and **two consecutive bracketed samples must be byte-equivalent after canonicalization of the relevant account and function allocation state**. The function set is part of the fingerprint. The collector allows at most three attempts; failure to obtain two consecutive identical samples is a hard collection failure rather than a best-effort estimate.
 
 The collector records:
 
@@ -152,6 +154,7 @@ The collector records:
 - AWS CLI v2 version, resolved executable path, and executable SHA-256 for live collection;
 - the recent Fargate On-Demand and EC2 Standard On-Demand vCPU usage windows used in free-capacity calculations;
 - every currently enumerated Lambda function's reserved concurrency plus each provisioned-concurrency configuration, using the maximum of requested/allocated/available values as the conservative claim while a configuration may be converging;
+- Lambda snapshot-verification metadata, including the two-consecutive-bracketed-sample method, attempts used, relevant account concurrency values, and a SHA-256 of the stabilized allocation fingerprint;
 - the exact incident-database user and account/region-bound `rds-db:connect` ARN and policy templates with only the future DBI resource ID left as a placeholder;
 - a SHA-256 companion for the complete controlled report.
 
@@ -177,6 +180,7 @@ The report must be green at minimum for the frozen P0 thresholds and the explici
 | ALB/VPC | >=1 ALB and >=1 VPC headroom |
 | Network safety margin | >=8 free regional security groups and >=32 free regional ENI slots before create |
 | CodeBuild | account-applied Linux/Large concurrency >=1; >=3 project headroom; P0-recorded non-adjustable VPC limits cover one build SG and two private app/control subnets |
+| Lambda snapshot coherence | bracket every full allocation inventory with account concurrency reads; require two consecutive identical canonical snapshots, including function-set stability, within three attempts or fail collection |
 | Lambda inventory | enumerate every current function's reserved concurrency and provisioned-concurrency configs; account `ConcurrentExecutions - UnreservedConcurrentExecutions` must equal the enumerated reserved total or the report fails closed as a raced/incomplete inventory |
 | Lambda protected reservations | deduct provisioned concurrency on functions without reserved concurrency from account `UnreservedConcurrentExecutions`, then require enough effective unreserved capacity to add six one-unit protected reservations while still preserving >=100 unreserved |
 | DynamoDB | >=2 table headroom; initial beta remains PAY_PER_REQUEST |
@@ -248,9 +252,31 @@ GetAccountSettings:
   UnreservedConcurrentExecutions
 
 per-function inventory:
+  current function set
   ReservedConcurrentExecutions
   all ProvisionedConcurrencyConfigs
 ```
+
+The Lambda APIs do not provide one transactionally atomic read across those surfaces. The collector therefore constructs a fail-closed stable observation:
+
+```text
+attempt N:
+  GetAccountSettings (before)
+  enumerate complete function set
+  for every function:
+    GetFunctionConcurrency
+    ListProvisionedConcurrencyConfigs
+  GetAccountSettings (after)
+
+accept an attempt only when:
+  relevant account concurrency before == after
+
+accept the overall Lambda observation only when:
+  two consecutive accepted attempts have identical canonical
+  account + function-set + reserved/provisioned allocation state
+```
+
+At most three attempts are made. If the state continues to change, collection fails rather than selecting one raced sample. Function order and provisioned-configuration order are canonicalized before comparison so provider ordering alone does not create a false race. The retained report records the stabilized snapshot fingerprint and verification metadata.
 
 `UnreservedConcurrentExecutions` already reflects reserved concurrency. The collector independently enumerates the reserved total and requires it to match `ConcurrentExecutions - UnreservedConcurrentExecutions`; disagreement is treated as a race or incomplete observation and fails closed.
 
@@ -272,7 +298,32 @@ where six is the number of one-unit protected reservations frozen by the correct
 
 ---
 
-## 8. DynamoDB on-demand boundary
+## 8. Live parser/provider-contract regression boundary
+
+The fixture suite exercises the pure admission evaluator, but the P1 collector also depends on nontrivial live AWS response classification and merging. CI therefore includes mocked read-only AWS response coverage for the live parsing layer, including:
+
+```text
+ECS Express:
+  ResourceNotFoundException => regional API recognized
+  UnsupportedFeatureException => regional API unsupported
+
+Service Quotas:
+  applied account value overrides same-code provider default
+  default-only entries remain explicitly tagged aws-default
+
+CloudWatch AWS/Usage:
+  ResourceCount datapoints retain the maximum used for headroom
+
+Lambda:
+  two stable bracketed allocation samples are accepted
+  changing provisioned concurrency across samples fails closed
+```
+
+These tests prove collector behavior against representative provider contracts; they are not a substitute for the live no-create run against the intended production account.
+
+---
+
+## 9. DynamoDB on-demand boundary
 
 The initial protected release-control tables remain DynamoDB `PAY_PER_REQUEST`. The P0 record captured AWS's initial 40,000 read-request-unit and 40,000 write-request-unit per-table on-demand envelope.
 
@@ -280,7 +331,7 @@ AWS does not apply an account-level read/write throughput quota to on-demand tab
 
 ---
 
-## 9. Evidence handling
+## 10. Evidence handling
 
 The complete admission JSON contains AWS account identity and current infrastructure inventory. It is controlled operational evidence and must not be blindly committed to this public repository.
 
@@ -290,7 +341,7 @@ A green fixture run or repository CI run proves only collector behavior. The liv
 
 ---
 
-## 10. What remains after pre-create admission
+## 11. What remains after pre-create admission
 
 A green live no-create report is one required input to the next P1 implementation slice; it does not independently authorize provisioning and does not complete P1. Subsequent evidence must include, at minimum:
 
@@ -309,7 +360,7 @@ Only after those requirements and the governing P1 acceptance evidence are satis
 
 ---
 
-## 11. Current state
+## 12. Current state
 
 ```text
 P0: CLOSED and merged at fc46a2843ac79cef23b82b08cc08dba5a1a1b095
