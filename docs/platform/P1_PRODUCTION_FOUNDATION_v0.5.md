@@ -1,7 +1,7 @@
 # Platform v0.5 — P1 Production Foundation
 
 **Status:** P1 IN PROGRESS / PRE-PROVISION ADMISSION TOOLING ONLY  
-**Date:** 2026-09-20  
+**Date:** 2026-09-21  
 **P0 baseline:** `fc46a2843ac79cef23b82b08cc08dba5a1a1b095`  
 **Governing contract:** `PLATFORM_PRODUCTION_BETA_v0.5.md` §15  
 **Authoritative provider/security decisions:** `PRODUCTION_PROVIDER_DECISIONS_v0.5.md` plus correction precedence through `PRODUCTION_PROVIDER_MAINTAINER_CORRECTIONS_R31_v0.5.md`
@@ -30,15 +30,19 @@ live no-create admission report is green
 + fresh exact-topology cost estimate remains below the USD 900/month stop/review threshold
 ```
 
-The report is therefore a necessary admission input, not stand-alone authority to create resources.
+The report is therefore a necessary admission input, not stand-alone authority to create resources. Repository CI validates the collector with fixtures and mocked read-only AWS responses only. CI is not production-account evidence and a fixture result can never be classified as a live admission pass.
 
-Repository CI validates the collector with fixtures and mocked read-only AWS responses only. CI is not production-account evidence and a fixture result can never be classified as a live admission pass.
+Even a green live report retains:
+
+```text
+productionResourceCreationAuthorizedByThisReport = false
+```
 
 ---
 
 ## 1. Frozen P0 inputs carried into P1
 
-The implementation must preserve the authoritative corrected baseline, including:
+The implementation preserves the authoritative corrected baseline, including:
 
 ```text
 AWS region: eu-west-1
@@ -77,11 +81,9 @@ private-db-a:          10.42.32.0/24
 private-db-b:          10.42.33.0/24
 ```
 
-The actual two Availability Zone names are **not hard-coded**. The admission report requires at least two enabled AZs that support the exact RDS configuration and requires `m7i.xlarge` to be offered in at least one of those selected AZs. The initial topology contains one worker host, so requiring the worker instance type in both selected AZs would be a stronger constraint than P0 requires.
+The actual two Availability Zone names are not hard-coded. The admission report requires at least two enabled AZs that support the exact RDS configuration and requires `m7i.xlarge` to be offered in at least one of those selected AZs. The initial topology contains one worker host, so requiring the worker instance type in both selected AZs would strengthen P0 unnecessarily.
 
-The collector requires the reviewed private application/control CIDRs rather than accepting arbitrary caller-supplied topology. It proves that the complete six-subnet plan is inside `10.42.0.0/16` and non-overlapping.
-
-The `/24` private application/control subnets deliberately exceed the collector's conservative pre-create margin of 32 usable IPv4 addresses per subnet. That margin, plus the regional security-group and ENI headroom checks, are P1 implementation safety checks rather than new P0 provider decisions.
+The collector requires the reviewed private application/control CIDRs rather than accepting arbitrary caller-supplied topology. The full six-subnet plan must fit inside `10.42.0.0/16` without overlap. The private application/control `/24`s exceed the conservative pre-create margin of 32 usable IPv4 addresses per subnet.
 
 No NAT gateway is selected for the initial beta.
 
@@ -106,10 +108,6 @@ gateway endpoints:
 ```
 
 The sensitive final-evaluator build retains no Internet/NAT path. The VPC-attached incident mediator reaches protected DynamoDB state through the DynamoDB gateway endpoint and reaches only the exact production RDS primary over the selected security-group TCP/5432 path.
-
-The no-create collector checks the applicable provider quota and current regional gateway-endpoint consumption. KMS is queried and required only when the implementation explicitly selects the optional KMS interface endpoint.
-
-A future unplanned AWS API dependency that would require another interface endpoint must be added to topology/cost/quota admission before provisioning rather than silently enabling NAT.
 
 ---
 
@@ -137,82 +135,15 @@ If the sensitive-build implementation requires a direct KMS endpoint, add:
 --require-kms-interface-endpoint
 ```
 
-The collector has an explicit read-only AWS-operation allowlist. It gathers account identity, account-applied adjustable quotas, recent Fargate/EC2 vCPU consumption from CloudWatch `AWS/Usage`, current regional resource consumption, exact RDS orderability/capability, regional VPC endpoint-service availability, a regional CodeBuild curated Linux-container capability observation, Lambda account concurrency and existing reserved/provisioned allocations, and the AZ/topology information needed by the reviewed plan. It performs no create/update/delete operation.
+The collector has an explicit read-only AWS-operation allowlist. It performs no create, update, delete, start, stop, reservation, or quota-change operation.
 
-For adjustable account quotas that can stop provisioning, the collector requires an account-applied value and refuses to substitute the provider default when Service Quotas does not expose one. Non-adjustable hard limits already frozen in P0 are evaluated as provider constraints against the reviewed topology instead of being misrepresented as account-applied values.
+For adjustable account quotas that can stop provisioning, the collector requires an account-applied value and refuses to substitute a provider default. Non-adjustable hard limits already frozen in P0 are represented as provider constraints rather than fabricated account observations.
 
-Fargate and Standard On-Demand EC2 admission is based on **remaining headroom**, not merely the nominal applied quota. The collector reads CloudWatch `AWS/Usage` `ResourceCount` for the quota-corresponding `vCPU` resource and retains the complete recent measurement window in controlled evidence. An empty window is unknown, not zero. The collector also requires the latest datapoint to be no older than five minutes; absent or stale telemetry leaves the admission check red.
+### 4.1 Compute-vCPU evidence is metric plus direct inventory
 
-R19 separately requires the selected CodeBuild environment to be usable in `eu-west-1`, not merely to have a nominal concurrency quota. The collector therefore combines three read-only/provider facts before this surface can pass:
+Fargate On-Demand and EC2 Standard On-Demand admission is based on **remaining headroom**, not nominal quota.
 
-```text
-1. account-applied Linux/Large concurrent-build quota >= 1
-2. regional CodeBuild ListCuratedEnvironmentImages succeeds and returns
-   at least one Linux curated Docker image on the eu-west-1 endpoint
-3. the P0-frozen provider mapping remains
-   LINUX_CONTAINER + BUILD_GENERAL1_LARGE, with the recorded VPC limits
-```
-
-This is the strongest pre-create read-only capability proof available without provisioning or starting a protected build. It is deliberately not represented as proof that a future project has executed successfully. The created protected projects must still prove the exact private-VPC/Docker configuration after provisioning and before production reliance.
-
-ECS Express capability is checked by a real read-only `DescribeExpressGatewayService` call against a deliberately nonexistent service ARN. A documented `ResourceNotFoundException` or equivalent service/cluster-not-found response proves that the regional API recognizes the operation. A documented `UnsupportedFeatureException` is classified as regional unsupported. A local CLI command model alone is not accepted as regional evidence.
-
-Lambda concurrency collection is deliberately repeated rather than treated as one atomic API snapshot. Each attempt brackets the full function/reserved/provisioned inventory with `GetAccountSettings` before and after the inventory. The account concurrency fields must be unchanged across that bracket, and **two consecutive bracketed samples must be byte-equivalent after canonicalization of the relevant account and function allocation state**. The function set is part of the fingerprint. The collector allows at most three attempts; failure to obtain two consecutive identical samples is a hard collection failure rather than a best-effort estimate.
-
-The collector records:
-
-- `evidenceSource=fixture` or `evidenceSource=live-aws`;
-- the committed collector revision and script SHA-256;
-- AWS CLI v2 version, resolved executable path, and executable SHA-256 for live collection;
-- the recent Fargate On-Demand and EC2 Standard On-Demand vCPU usage windows, freshness metadata, and maxima used in free-capacity calculations;
-- the regional CodeBuild curated Linux-container observation used with the account-applied Linux/Large quota and frozen provider mapping;
-- every currently enumerated Lambda function's reserved concurrency plus each provisioned-concurrency configuration, using the maximum of requested/allocated/available values as the conservative claim while a configuration may be converging;
-- Lambda snapshot-verification metadata, including the two-consecutive-bracketed-sample method, attempts used, relevant account concurrency values, and a SHA-256 of the stabilized allocation fingerprint;
-- the exact incident-database user and account/region-bound `rds-db:connect` ARN and policy templates with only the future DBI resource ID left as a placeholder;
-- a SHA-256 companion for the complete controlled report.
-
-Only a live report may set `liveAdmissionPassed=true`. Even a green live report leaves `productionResourceCreationAuthorizedByThisReport=false` because the cost and maintainer-evidence gates remain separate requirements.
-
-The complete report and its digest companion are written atomically with owner-only (`0600`) permissions on POSIX systems.
-
----
-
-## 5. Admission checks
-
-The report must be green at minimum for the frozen P0 thresholds and the explicitly documented P1 safety margins:
-
-| Surface | Admission requirement |
-|---|---|
-| Region | `eu-west-1` enabled |
-| Fargate | account-applied On-Demand vCPU quota minus recent maximum observed `AWS/Usage` On-Demand Fargate vCPU consumption leaves **>=6 free vCPU**; telemetry must contain a sufficiently recent datapoint |
-| EC2 worker | account-applied Standard On-Demand vCPU quota minus recent maximum observed `AWS/Usage` Standard On-Demand EC2 vCPU consumption leaves **>=4 free vCPU**; telemetry must contain a sufficiently recent datapoint; `m7i.xlarge` is offered in at least one selected RDS-capable AZ |
-| RDS exact selection | PostgreSQL 18.6 + `db.m8gd.large` + `gp3` orderable; VPC, encryption, storage autoscaling and IAM DB authentication supported; 20 GiB initial / >=100 GiB max support |
-| RDS AZ topology | at least two enabled AZs support the exact RDS configuration; one of the selected AZs also offers `m7i.xlarge` |
-| RDS capacity | >=2 DB-instance slots and >=200 GiB headroom after existing instances' configured autoscaling ceilings |
-| RDS backup/topology | >=2 free manual DB-snapshot slots; P0-recorded DB subnet-group hard limit permits the two reviewed DB subnets |
-| ALB/VPC | >=1 ALB and >=1 VPC headroom |
-| Network safety margin | >=8 free regional security groups and >=32 free regional ENI slots before create |
-| CodeBuild | account-applied Linux/Large concurrency >=1; >=3 project headroom; regional curated-environment read returns Linux Docker capability; P0-frozen `LINUX_CONTAINER + BUILD_GENERAL1_LARGE` mapping and VPC limits cover one build SG and two private app/control subnets |
-| Lambda snapshot coherence | bracket every full allocation inventory with account concurrency reads; require two consecutive identical canonical snapshots, including function-set stability, within three attempts or fail collection |
-| Lambda inventory | enumerate every current function's reserved concurrency and provisioned-concurrency configs; account `ConcurrentExecutions - UnreservedConcurrentExecutions` must equal the enumerated reserved total or the report fails closed as a raced/incomplete inventory |
-| Lambda protected reservations | deduct provisioned concurrency on functions without reserved concurrency from account `UnreservedConcurrentExecutions`, then require enough effective unreserved capacity to add six one-unit protected reservations while still preserving >=100 unreserved |
-| DynamoDB | >=2 table headroom; initial beta remains PAY_PER_REQUEST |
-| DynamoDB throughput semantics | P0's 40k/40k initial per-table on-demand envelope is a provider baseline, not a fictitious account-level on-demand throughput quota; the created tables' explicit maximum-throughput configuration is verified post-create |
-| VPC endpoints | account quota plus current gateway-endpoint headroom and service availability for required endpoint types |
-| Private app/control subnets | reviewed `/24` CIDRs and >=32 usable IPv4 addresses each as a conservative P1 margin |
-| Incident mediator | VPC attachment shape fits Lambda limits, no NAT/Internet egress is selected, DynamoDB gateway access is planned, and RDS path is TCP/5432 |
-| Incident DB authority | IAM DB authentication selected for exact user `fpllm_incident_fence`; report binds `arn:aws:rds-db:eu-west-1:<account>:dbuser:<DBI_RESOURCE_ID>/fpllm_incident_fence` and an allow policy containing only `rds-db:connect` to that resource template; created DBI resource ID/effective policy remain post-create proof |
-| Incident DB budget | exact planned maximum of one concurrent `fpllm_incident_fence` session; live RDS `max_connections`/headroom proof remains required post-create before incident use |
-
-Any failed frozen minimum is a hard provisioning stop. A normal adjustable quota increase may be requested and the report re-run. A provider/class/region/topology substitution requires an explicit P0 amendment.
-
----
-
-## 6. Compute-vCPU headroom evidence boundary
-
-The P0 minima of 6 Fargate On-Demand vCPU and 4 Standard On-Demand EC2 vCPU are capacity minima for this production slice. A nominal account quota at exactly those values is insufficient if another workload is already consuming the quota.
-
-AWS publishes quota-corresponding `ResourceCount` usage metrics in the `AWS/Usage` namespace. For this admission report the collector reads:
+CloudWatch `AWS/Usage` remains the quota-corresponding historical observation:
 
 ```text
 Fargate:
@@ -228,196 +159,188 @@ EC2:
   Class = Standard/OnDemand
 ```
 
-The collector requests a 15-minute read-only window at one-minute resolution and uses the window's `Maximum` value only when the response contains a sufficiently recent datapoint. The latest datapoint must be no more than five minutes old. The calculations are:
+The collector requests a 15-minute window at one-minute resolution. Empty telemetry is unknown, not zero; the newest datapoint must be no more than five minutes old.
+
+Fresh CloudWatch data alone is not sufficient because a task or instance can launch after the newest metric sample. The collector therefore brackets both CloudWatch reads with direct read-only account inventory:
 
 ```text
-free Fargate On-Demand vCPU
-= applied Fargate On-Demand vCPU quota
-- recent maximum observed Fargate On-Demand vCPU usage
-
-free Standard On-Demand EC2 vCPU
-= applied Standard On-Demand EC2 vCPU quota
-- recent maximum observed Standard On-Demand EC2 vCPU usage
+direct ECS/EC2 inventory A
+  -> Fargate AWS/Usage read
+  -> EC2 AWS/Usage read
+  -> direct ECS/EC2 inventory B
 ```
 
-Admission requires:
+The two direct inventories must canonicalize to the same fingerprint. If they differ, the complete bracket is retried, up to three attempts. If no stable bracket is obtained, collection fails closed.
+
+For the accepted bracket:
 
 ```text
-fresh usage telemetry exists
-free Fargate On-Demand vCPU >= 6
-free Standard On-Demand EC2 vCPU >= 4
+effective Fargate usage
+= max(recent CloudWatch maximum, direct ECS Fargate On-Demand inventory)
+
+effective Standard EC2 usage
+= max(recent CloudWatch maximum, direct active Standard On-Demand EC2 inventory)
 ```
 
-A 15-minute maximum is deliberately conservative relative to a single instantaneous sample: recently released capacity is not immediately assumed free for the gate. **An empty datapoint window is not interpreted as zero usage.** Empty or stale telemetry is retained as controlled evidence with `telemetryComplete=false` and `maximumObservedVcpu=null`, which makes the corresponding headroom check fail. This prevents delayed/missing metrics from being converted into false free capacity.
+Admission then requires:
 
-This evidence is still a point-in-time admission observation, not a reservation of quota. A later account-state change can consume headroom, so provisioning/release operations remain responsible for ordinary provider errors and must not reinterpret them as learner failures.
+```text
+applied Fargate On-Demand quota - effective Fargate usage >= 6 vCPU
+applied Standard On-Demand quota - effective Standard EC2 usage >= 4 vCPU
+```
+
+The direct EC2 inventory counts active (`pending` or `running`) non-Spot instances in the Standard A/C/D/H/I/M/R/T/Z quota family bucket and resolves each observed instance type's current `DefaultVCpus` read-only from EC2.
+
+The direct Fargate inventory enumerates current ECS tasks, excludes `FARGATE_SPOT`, and derives task CPU from the task or task definition. Because the Fargate quota can also be consumed by EKS and this first collector does not enumerate Kubernetes pods, the presence of any EKS cluster is a hard fail-closed collection condition rather than an assumption of zero non-ECS Fargate use.
+
+This is still a point-in-time observation, not a capacity reservation. It closes the specific metric-lag false-pass where a launch occurred before the final inventory but after the latest metric datapoint; it does not claim that a later account-state change cannot consume quota.
+
+### 4.2 VPC security-group quota uses the real provider scope
+
+AWS Service Quotas exposes **`Security groups per VPC`**, not a regional security-group-count quota for this surface. The production VPC is new, so the collector checks:
+
+```text
+account-applied Security groups per VPC >= 8
+```
+
+It does not subtract an account-wide security-group inventory from this per-VPC limit. ENI capacity remains a regional headroom check because that provider quota is regional.
+
+### 4.3 CodeBuild pre-create capability
+
+R19 requires the selected protected-build environment to be usable in `eu-west-1`, not merely to have a nominal slot. The collector combines:
+
+```text
+1. account-applied Linux/Large concurrent-build quota >= 1
+2. regional ListCuratedEnvironmentImages succeeds and returns >=1 Linux curated Docker image
+3. frozen provider mapping remains LINUX_CONTAINER + BUILD_GENERAL1_LARGE
+4. frozen CodeBuild VPC SG/subnet limits cover the reviewed shape
+```
+
+This remains a pre-create read-only capability proof. It is not proof that a future protected project has executed its private-VPC/Docker configuration; that stays post-create evidence.
+
+### 4.4 ECS Express capability
+
+ECS Express capability is checked by a real read-only `DescribeExpressGatewayService` call against a deliberately nonexistent service ARN. `ResourceNotFoundException` (or equivalent service/cluster-not-found response) proves that the regional API recognizes the operation. `UnsupportedFeatureException` is classified as regional unsupported. Access denial and unclassified errors fail closed.
+
+### 4.5 Lambda concurrency coherence
+
+Each Lambda snapshot attempt brackets the full function/reserved/provisioned inventory with `GetAccountSettings`. Account concurrency fields must be unchanged across the bracket, and two consecutive bracketed snapshots must have the same canonical fingerprint, including the function set. The collector allows at most three attempts.
+
+The accepted observation retains every current function's reserved concurrency and each provisioned-concurrency configuration. The conservative provisioned claim is the maximum of requested, allocated, and available values. Provisioned concurrency on functions without reserved concurrency is deducted separately from effective unreserved capacity.
+
+### 4.6 Controlled evidence publication is one atomic generation
+
+The controlled evidence output is a **single self-verifying envelope**, not a report plus detached checksum sidecar:
+
+```json
+{
+  "envelopeVersion": "1",
+  "kind": "fpllm-controlled-evidence-envelope",
+  "reportSha256": "<sha256 of canonical nested report payload>",
+  "report": { "...": "..." }
+}
+```
+
+The envelope is written to an owner-only (`0600`) temporary file, file contents are `fsync`ed, and one `os.replace()` publishes the generation. The parent directory is then `fsync`ed where supported. Temporary names contain a random nonce, so concurrent writers cannot collide on staging files.
+
+There is deliberately **no detached `.sha256` file**. Therefore a crash or concurrent writer cannot leave a new report paired with an old checksum, or vice versa. Before the one atomic replace, readers see the prior complete envelope; after it, readers see the new complete envelope. Tests cover simulated replacement interruption and concurrent writers.
+
+The report retains collector Git revision/script SHA-256, AWS CLI version/executable SHA-256 for live collection, compute metric and direct-inventory evidence, Lambda snapshot-verification metadata, the exact incident DB identity/policy templates, and all admission checks.
 
 ---
 
-## 7. CodeBuild pre-create capability boundary
+## 5. Admission checks
 
-R19 freezes all three protected projects to:
+The report must be green at minimum for the frozen P0 thresholds and the explicitly documented P1 safety margins:
 
-```text
-environment type: LINUX_CONTAINER
-compute type:     BUILD_GENERAL1_LARGE
-region:           eu-west-1
-concurrency:      one protected build globally
-```
+| Surface | Admission requirement |
+|---|---|
+| Region | `eu-west-1` enabled |
+| Fargate | account-applied On-Demand vCPU quota minus `max(fresh AWS/Usage maximum, stable direct ECS Fargate On-Demand inventory)` leaves **>=6 free vCPU**; empty/stale telemetry or raced direct inventory fails closed; any EKS cluster fails closed until that consumption domain is explicitly supported |
+| EC2 worker | account-applied Standard On-Demand vCPU quota minus `max(fresh AWS/Usage maximum, stable direct active Standard On-Demand EC2 inventory)` leaves **>=4 free vCPU**; `m7i.xlarge` is offered in at least one selected RDS-capable AZ |
+| Compute snapshot coherence | direct ECS/EC2 inventory before and after the metric reads must have the same fingerprint within three attempts |
+| RDS exact selection | PostgreSQL 18.6 + `db.m8gd.large` + `gp3` orderable; VPC, encryption, storage autoscaling and IAM DB authentication supported; 20 GiB initial / >=100 GiB max support |
+| RDS AZ topology | at least two enabled AZs support the exact RDS configuration; one selected AZ also offers `m7i.xlarge` |
+| RDS capacity | >=2 DB-instance slots and >=200 GiB headroom after existing instances' configured autoscaling ceilings |
+| RDS backup/topology | >=2 free manual DB-snapshot slots; P0 DB-subnet-group hard limit admits two reviewed DB subnets |
+| ALB/VPC | >=1 ALB and >=1 VPC headroom |
+| Security groups | account-applied **Security groups per VPC** >=8 for the new production VPC; no fabricated regional SG quota/inventory subtraction |
+| ENI | >=32 free regional network-interface slots |
+| CodeBuild | account-applied Linux/Large concurrency >=1; >=3 project headroom; regional curated Linux Docker capability; frozen `LINUX_CONTAINER + BUILD_GENERAL1_LARGE` mapping and VPC limits |
+| Lambda snapshot coherence | bracket full allocation inventory with account concurrency reads; require two consecutive identical canonical snapshots within three attempts |
+| Lambda inventory | enumerated reserved total must equal account `ConcurrentExecutions - UnreservedConcurrentExecutions`; disagreement fails closed |
+| Lambda protected reservations | after deducting provisioned-only allocation, enough capacity remains for six one-unit protected reservations plus >=100 unreserved |
+| DynamoDB | >=2 table headroom; initial beta remains PAY_PER_REQUEST |
+| DynamoDB throughput semantics | P0 40k/40k initial per-table on-demand envelope remains provider baseline, not a fictitious account-level throughput quota |
+| VPC endpoints | account quota/headroom and service availability cover required endpoint types |
+| Private app/control subnets | reviewed `/24` CIDRs and >=32 usable IPv4 addresses each |
+| Incident mediator | VPC attached, no NAT/Internet, DynamoDB gateway path, RDS TCP/5432 path |
+| Incident DB authority | IAM DB auth selected for exact user `fpllm_incident_fence`; account/region-bound `rds-db:connect` ARN/policy template retained; created DBI resource ID/effective policy remain post-create proof |
+| Incident DB budget | exactly one planned concurrent fence-only DB session; live RDS connection headroom remains post-create proof |
 
-The first P1 report must not infer environment usability from a generic CodeBuild service response or a published default quota. The pre-create proof combines:
-
-```text
-live/account evidence:
-  account-applied Linux/Large concurrent-build quota >= 1
-  eu-west-1 ListCuratedEnvironmentImages call succeeds
-  returned regional catalog contains at least one Linux curated Docker image
-
-frozen provider evidence from P0/R19:
-  LINUX_CONTAINER maps to BUILD_GENERAL1_LARGE
-  Linux/Large supplies the frozen 16 GiB / 8-vCPU class
-  CodeBuild VPC config admits the reviewed SG/subnet counts
-```
-
-The curated-image observation is not treated as proof about the eventual protected image contents, project IAM, VPC routing, Docker privilege, or build execution. Those are post-create verification surfaces. It is a read-only regional capability signal paired with the exact account-applied Linux/Large slot, rather than a fabricated assertion that quota alone proves the selected environment exists.
-
-If the regional CodeBuild read is unavailable, malformed, or exposes no Linux curated Docker image, the admission report remains red. P1 does not silently select another compute type or region.
-
----
-
-## 8. Lambda concurrency evidence boundary
-
-R19 requires the first P1 report to consider existing **reserved and provisioned** concurrency allocations, not merely the nominal Regional concurrency limit.
-
-The collector therefore combines two distinct views:
-
-```text
-GetAccountSettings:
-  ConcurrentExecutions
-  UnreservedConcurrentExecutions
-
-per-function inventory:
-  current function set
-  ReservedConcurrentExecutions
-  all ProvisionedConcurrencyConfigs
-```
-
-The Lambda APIs do not provide one transactionally atomic read across those surfaces. The collector therefore constructs a fail-closed stable observation:
-
-```text
-attempt N:
-  GetAccountSettings (before)
-  enumerate complete function set
-  for every function:
-    GetFunctionConcurrency
-    ListProvisionedConcurrencyConfigs
-  GetAccountSettings (after)
-
-accept an attempt only when:
-  relevant account concurrency before == after
-
-accept the overall Lambda observation only when:
-  two consecutive accepted attempts have identical canonical
-  account + function-set + reserved/provisioned allocation state
-```
-
-At most three attempts are made. If the state continues to change, collection fails rather than selecting one raced sample. Function order and provisioned-configuration order are canonicalized before comparison so provider ordering alone does not create a false race. The retained report records the stabilized snapshot fingerprint and verification metadata.
-
-`UnreservedConcurrentExecutions` already reflects reserved concurrency. The collector independently enumerates the reserved total and requires it to match `ConcurrentExecutions - UnreservedConcurrentExecutions`; disagreement is treated as a race or incomplete observation and fails closed.
-
-Provisioned concurrency that belongs to a function with reserved concurrency is already covered by that function's reserved allocation and is not deducted again. Provisioned concurrency on a function without reserved concurrency consumes the shared account pool, so the conservative pre-create calculation is:
-
-```text
-effective unreserved
-= UnreservedConcurrentExecutions
-- provisioned concurrency not covered by function reserved concurrency
-```
-
-The admission minimum is then:
-
-```text
-effective unreserved >= 100 + 6
-```
-
-where six is the number of one-unit protected reservations frozen by the corrected topology. For a provisioned-concurrency configuration in transition, the collector uses the maximum of its requested, allocated, and available values rather than assuming the smallest transient value is safe.
+Any failed frozen minimum is a hard provisioning stop. A normal adjustable quota increase may be requested and the report re-run. A provider/class/region/topology substitution requires an explicit P0 amendment.
 
 ---
 
-## 9. Live parser/provider-contract regression boundary
+## 6. Read-only authority surface
 
-The fixture suite exercises the pure admission evaluator, but the P1 collector also depends on nontrivial live AWS response classification and merging. CI therefore includes mocked read-only AWS response coverage for the live parsing layer, including:
-
-```text
-ECS Express:
-  ResourceNotFoundException => regional API recognized
-  UnsupportedFeatureException => regional API unsupported
-
-Service Quotas:
-  applied account value overrides same-code provider default
-  default-only entries remain explicitly tagged aws-default
-
-CloudWatch AWS/Usage:
-  fresh ResourceCount datapoints retain the maximum used for headroom
-  empty or stale telemetry remains unknown and fails admission
-
-CodeBuild:
-  regional curated Linux catalog is parsed as a capability observation
-  malformed or absent Linux capability cannot satisfy the environment gate
-
-Lambda:
-  two stable bracketed allocation samples are accepted
-  changing provisioned concurrency across samples fails closed
-```
-
-These tests prove collector behavior against representative provider contracts; they are not a substitute for the live no-create run against the intended production account.
-
----
-
-## 10. DynamoDB on-demand boundary
-
-The initial protected release-control tables remain DynamoDB `PAY_PER_REQUEST`. The P0 record captured AWS's initial 40,000 read-request-unit and 40,000 write-request-unit per-table on-demand envelope.
-
-AWS does not apply an account-level read/write throughput quota to on-demand tables. Therefore the pre-create collector must not invent an account-level throughput value merely to make the report look more comprehensive. Before the tables exist, the collector proves table-count headroom and retains the frozen provider baseline. After creation, P1 must prove the exact tables are `PAY_PER_REQUEST` and that no configured table-level maximum is below the bounded release-control requirement.
-
----
-
-## 11. Evidence handling
-
-The complete admission JSON contains AWS account identity and current infrastructure inventory. It is controlled operational evidence and must not be blindly committed to this public repository.
-
-The public P1/release record may retain a redacted summary plus the report SHA-256. No secret value or credential is written by the collector.
-
-A green fixture run or repository CI run proves only collector behavior. The live admission condition becomes green only after the collector runs against the intended AWS account under an attributable read-only identity and the retained live report passes. Resource creation remains blocked until the fresh exact-topology cost estimate and maintainer evidence disposition also pass.
-
----
-
-## 12. What remains after pre-create admission
-
-A green live no-create report is one required input to the next P1 implementation slice; it does not independently authorize provisioning and does not complete P1. Subsequent evidence must include, at minimum:
-
-1. fresh exact-topology cost evidence below the USD 900/month stop/review threshold before creation;
-2. clean infrastructure provisioning from committed IaC after the complete pre-create gate is green;
-3. production migrations with the frozen expand-compatible discipline;
-4. exact IAM, ECR, CodeBuild, Lambda, DynamoDB, VPC endpoint, security-group and database-role negative-authority proofs;
-5. RDS IAM authentication enabled on the created primary and exact `rds-db:connect` identity/effective policy after replacing the DBI resource ID placeholder;
-6. live RDS connection headroom, including the <=1 incident-mediator session budget;
-7. real subnet available-IP/ENI capacity and VPC attachment evidence;
-8. realized DynamoDB `PAY_PER_REQUEST` configuration and table-level maximum-throughput evidence;
-9. the real protected CodeBuild projects successfully execute the frozen `LINUX_CONTAINER + BUILD_GENERAL1_LARGE` private-VPC/Docker configuration before production reliance;
-10. migration, backup/PITR, restore-to-clean-target and rollback runbooks/drills;
-11. retained production evidence separating design intent from verified state.
-
-Only after those requirements and the governing P1 acceptance evidence are satisfied may P1 be marked complete.
-
----
-
-## 13. Current state
+The allowlist contains descriptive/list/get operations only. The compute-race correction adds only read operations:
 
 ```text
-P0: CLOSED and merged at fc46a2843ac79cef23b82b08cc08dba5a1a1b095
-P1 admission collector: implementation/review in progress
-live AWS read-only admission report: NOT YET RUN / NOT YET VERIFIED
-fresh exact-topology cost estimate: NOT YET VERIFIED
-AWS production resources created by this P1 slice: NONE
-P1 gate: OPEN
+EC2:
+  DescribeInstances
+  DescribeInstanceTypes
+
+ECS:
+  ListClusters
+  ListTasks
+  DescribeTasks
+  DescribeTaskDefinition
+
+EKS:
+  ListClusters
 ```
+
+No `RunInstances`, `StartTask`, `RunTask`, `Create*`, `Update*`, `Delete*`, quota-request, reservation, or capacity mutation is permitted by the collector wrapper. Any operation not in the explicit allowlist raises `AdmissionError` before subprocess execution.
+
+---
+
+## 7. Evidence custody and verification
+
+The complete live envelope may contain AWS account identity, inventory, ARNs, quota values, and topology observations. It is controlled operational evidence and must not be committed blindly to the public repository.
+
+Verification of one envelope is deterministic:
+
+```text
+1. read envelope.report
+2. canonicalize as sorted compact JSON plus trailing newline
+3. SHA-256 those bytes
+4. require result == envelope.reportSha256
+```
+
+A fixture-generated envelope can prove collector behavior only. Only `evidenceSource=live-aws` plus a green report may set `liveAdmissionPassed=true`, and even then resource-creation authority remains false until the separate maintainer and cost gates are satisfied.
+
+---
+
+## 8. Post-create evidence still required
+
+A green pre-create report does not prove realized resources. P1 must later retain evidence for at least:
+
+```text
+RDS IAM database authentication enabled on the created primary
+exact DBI resource ID substituted into the rds-db:connect ARN/effective policy
+live RDS max_connections/headroom including <=1 incident-mediator session
+actual subnet available-IP counts and Lambda/CodeBuild ENI attachment
+actual endpoint policies and route-table associations
+DynamoDB PAY_PER_REQUEST plus realized maximum-throughput configuration
+protected CodeBuild projects executing the frozen private-VPC/Docker configuration
+backup/restore and rollback drills
+```
+
+---
+
+## 9. Current P1 stopping point
+
+This PR remains a **pre-provision admission slice**. It may be merged only after exact-head CI, fresh exhaustive maintainer exact-head review, fresh independent exact-head second opinion, actionable-thread disposition, and final exact-head checks.
+
+After merge, the next operational action is still not unconditional provisioning. The next action is to execute the collector under an attributable short-lived read-only/federated production-account identity, retain the controlled envelope, perform maintainer disposition, and refresh the exact-topology cost estimate under the USD 900/month stop/review threshold.
