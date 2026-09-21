@@ -119,6 +119,14 @@ The repository entry point is:
 scripts/ops/p1_readonly_admission.py
 ```
 
+The stable entry point loads the reviewed implementation core from:
+
+```text
+scripts/ops/p1_readonly_admission_core.py
+```
+
+The split is deliberate. The core retains the reviewed fail-closed collector while the small entry point contains the final provider-accounting correction for future-dated EC2 Capacity Reservation commitments. Live evidence provenance binds **both** files to the same Git revision and records a SHA-256 and tracked-working-tree cleanliness result for each. A live run fails if either tracked collector file differs from the committed checkout.
+
 Example execution under a short-lived read-only/federated AWS identity:
 
 ```bash
@@ -191,11 +199,32 @@ applied Standard On-Demand quota - effective Standard EC2 usage >= 4 vCPU
 
 The direct EC2 quota inventory counts only `running` non-Spot instances in the Standard A/C/D/H/I/M/R/T/Z family bucket; `pending`, `stopping`, `stopped`, and `hibernated` instances do not consume the On-Demand Instance vCPU quota. It also counts **owned** non-Capacity-Block Capacity Reservations in provider quota-counting states (`assessing`, `scheduled`, `pending`, `active`, or `delayed`), including unused reserved capacity. Running instances covered by one of those owned reservations remain in the evidence record but are not added again to the reservation's already-counted vCPU claim. Instance and reservation types are resolved read-only through `DescribeInstanceTypes` to their current `DefaultVCpus`. Capacity Blocks are excluded because AWS gives them a separate quota surface and instances in a Capacity Block do not count against On-Demand Instance limits.
 
+Future-dated Capacity Reservations require one additional provider-state rule. AWS can expose a scheduled/future-dated reservation with `TotalInstanceCount == 0` before delivered capacity exists while `CommitmentInfo.CommittedInstanceCount` already represents committed capacity that counts against the owner's On-Demand quota. For every provider-documented quota-counting non-Capacity-Block reservation, the collector therefore uses:
+
+```text
+quotaInstanceCount
+= max(TotalInstanceCount, CommitmentInfo.CommittedInstanceCount when present)
+
+reservation quota vCPU
+= quotaInstanceCount * DefaultVCpus(instance type)
+```
+
+When the committed count increases the effective quota count, the report retains the reservation ID/state, provider-reported total, committed count, and resulting quota count. A malformed negative committed count fails closed. This closes the future-dated reservation false-green case without changing the existing covered-instance de-duplication rule.
+
 Shared Capacity Reservations are intentionally not modeled exactly in this first admission slice. A consumer account using capacity shared by another owner can therefore be treated conservatively as ordinary running On-Demand usage against the consumer's applied quota. That may cause a false-negative admission stop, but it cannot manufacture free headroom or create a false-positive admission pass. Exact shared-reservation accounting remains outside this initial no-create collector.
 
 The direct Fargate inventory enumerates both `desiredStatus=RUNNING` and `desiredStatus=STOPPED`, deduplicates task ARNs, and retains On-Demand Fargate tasks while their `lastStatus` remains non-terminal (`PROVISIONING`, `PENDING`, `ACTIVATING`, `RUNNING`, `DEACTIVATING`, `STOPPING`, or `DEPROVISIONING`). `FARGATE_SPOT` and terminal `lastStatus=STOPPED` tasks are excluded. Task CPU is derived from the task or task definition. Because the Fargate quota can also be consumed by EKS and this first collector does not enumerate Kubernetes pods, the presence of any EKS cluster is a hard fail-closed collection condition rather than an assumption of zero non-ECS Fargate use.
 
 This is still a point-in-time observation, not a capacity reservation. It closes the specific metric-lag false-pass where quota-consuming state existed before the final inventory but after the latest metric datapoint; it does not claim that a later account-state change cannot consume quota.
+
+Official EC2 provider basis:
+
+- <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-on-demand-instances.html>
+- <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-capacity-reservations.html>
+- <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/cr-concepts.html>
+- <https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CapacityReservationCommitmentInfo.html>
+- <https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeCapacityReservations.html>
+- <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-capacity-blocks.html>
 
 ### 4.2 VPC security-group quota uses the documented regional scope
 
@@ -249,7 +278,7 @@ The envelope is written to an owner-only (`0600`) temporary file, file contents 
 
 There is deliberately **no detached `.sha256` file**. Therefore a crash or concurrent writer cannot leave a new report paired with an old checksum, or vice versa. Before the one atomic replace, readers see the prior complete envelope; after it, readers see the new complete envelope. Tests cover simulated replacement interruption and concurrent writers.
 
-The report retains collector Git revision/script SHA-256, AWS CLI version/executable SHA-256 for live collection, compute metric and direct-inventory evidence, Lambda snapshot-verification metadata, the exact incident DB identity/policy templates, and all admission checks.
+The report retains collector Git revision plus SHA-256/cleanliness evidence for both the stable entry point and reviewed core, AWS CLI version/executable SHA-256 for live collection, compute metric and direct-inventory evidence, Lambda snapshot-verification metadata, the exact incident DB identity/policy templates, and all admission checks.
 
 ---
 
@@ -261,7 +290,7 @@ The report must be green at minimum for the frozen P0 thresholds and the explici
 |---|---|
 | Region | `eu-west-1` enabled |
 | Fargate | account-applied On-Demand vCPU quota minus `max(fresh AWS/Usage maximum, stable direct ECS Fargate On-Demand inventory)` leaves **>=6 free vCPU**; direct inventory includes non-terminal On-Demand tasks even when `desiredStatus=STOPPED`; empty/stale telemetry or raced direct inventory fails closed; any EKS cluster fails closed until that consumption domain is explicitly supported |
-| EC2 worker | account-applied Standard On-Demand vCPU quota minus `max(fresh AWS/Usage maximum, stable direct Standard On-Demand quota inventory)` leaves **>=4 free vCPU**; direct inventory counts running non-Spot Standard-family instances plus owned quota-counting On-Demand Capacity Reservations without double-counting covered instances, and excludes Capacity Blocks/non-running instances; `m7i.xlarge` is offered in at least one selected RDS-capable AZ |
+| EC2 worker | account-applied Standard On-Demand vCPU quota minus `max(fresh AWS/Usage maximum, stable direct Standard On-Demand quota inventory)` leaves **>=4 free vCPU**; direct inventory counts running non-Spot Standard-family instances plus owned quota-counting On-Demand Capacity Reservations, including future-dated committed counts, without double-counting covered instances, and excludes Capacity Blocks/non-running instances; `m7i.xlarge` is offered in at least one selected RDS-capable AZ |
 | Compute snapshot coherence | direct ECS/EC2 inventory before and after the metric reads must have the same fingerprint within three attempts |
 | RDS exact selection | PostgreSQL 18.6 + `db.m8gd.large` + `gp3` orderable; VPC, encryption, storage autoscaling and IAM database authentication supported; 20 GiB initial / >=100 GiB max support |
 | RDS AZ topology | at least two enabled AZs support the exact RDS configuration; one selected AZ also offers `m7i.xlarge` |
@@ -323,6 +352,18 @@ Verification of one envelope is deterministic:
 3. SHA-256 those bytes
 4. require result == envelope.reportSha256
 ```
+
+Live collector provenance additionally retains:
+
+```text
+scriptPath / scriptSha256 / scriptWorkingTreeClean
+  = scripts/ops/p1_readonly_admission.py
+
+coreScriptPath / coreScriptSha256 / coreScriptWorkingTreeClean
+  = scripts/ops/p1_readonly_admission_core.py
+```
+
+Both source files are bound to the same `gitCommit`; either tracked file being dirty is a hard live-evidence failure. This prevents the small provider-accounting entry point from changing live semantics while the evidence proves only the underlying core.
 
 A fixture-generated envelope can prove collector behavior only. Only `evidenceSource=live-aws` plus a green report may set `liveAdmissionPassed=true`, and even then resource-creation authority remains false until the separate maintainer and cost gates are satisfied.
 
