@@ -154,10 +154,10 @@ def collect_bracketed_compute_snapshot(
         try:
             before = _compute_inventory_once(cli, account)
             usage = {
-                "fargateOnDemand": collect_recent_vcpu_usage(
+                "fargateOnDemand": _core.collect_recent_vcpu_usage(
                     cli, "Fargate", "Standard/OnDemand"
                 ),
-                "ec2StandardOnDemand": collect_recent_vcpu_usage(
+                "ec2StandardOnDemand": _core.collect_recent_vcpu_usage(
                     cli, "EC2", "Standard/OnDemand"
                 ),
             }
@@ -277,19 +277,12 @@ def collector_provenance(require_clean: bool) -> dict[str, Any]:
     }
 
 
-def _lambda_concurrency_allocations_hook(cli: Any) -> dict[str, Any]:
-    """Preserve the public wrapper seam while core stable-snapshot logic remains authoritative."""
-    return globals()["collect_lambda_concurrency_allocations"](cli)
-
-
 # core.collect()/core.main() resolve these hooks in the core module at call time. Rebind
 # them before exposing/running main so both direct imports and CLI execution use the
-# corrected accounting and evidence provenance paths. The Lambda hook preserves the
-# public module seam used by the regression suite without duplicating stable-snapshot logic.
+# corrected accounting and evidence provenance paths.
 _core._compute_inventory_once = _compute_inventory_once
 _core.collect_bracketed_compute_snapshot = collect_bracketed_compute_snapshot
 _core.collector_provenance = collector_provenance
-_core.collect_lambda_concurrency_allocations = _lambda_concurrency_allocations_hook
 
 # Ensure corrected public helpers win over the initial re-export.
 globals()["collect_ec2_standard_inventory_once"] = collect_ec2_standard_inventory_once
