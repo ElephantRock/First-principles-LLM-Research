@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -100,6 +101,22 @@ class FutureDatedCapacityReservationTests(unittest.TestCase):
                 FakeCli([self.reservation(state="scheduled", total=0, committed=-1)]),
                 ACCOUNT,
             )
+
+
+class CollectorProvenanceTests(unittest.TestCase):
+    def test_provenance_binds_entrypoint_and_reviewed_core(self):
+        provenance = p1.collector_provenance(require_clean=False)
+        self.assertEqual(
+            provenance["scriptPath"], "scripts/ops/p1_readonly_admission.py"
+        )
+        self.assertEqual(
+            provenance["coreScriptPath"],
+            "scripts/ops/p1_readonly_admission_core.py",
+        )
+        self.assertRegex(provenance["scriptSha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(provenance["coreScriptSha256"], r"^[0-9a-f]{64}$")
+        if provenance.get("gitCommit") is not None:
+            self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", provenance["gitCommit"]))
 
 
 if __name__ == "__main__":
