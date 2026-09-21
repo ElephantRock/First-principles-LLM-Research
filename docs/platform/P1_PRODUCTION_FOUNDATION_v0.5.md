@@ -195,15 +195,17 @@ The direct Fargate inventory enumerates current ECS tasks, excludes `FARGATE_SPO
 
 This is still a point-in-time observation, not a capacity reservation. It closes the specific metric-lag false-pass where a launch occurred before the final inventory but after the latest metric datapoint; it does not claim that a later account-state change cannot consume quota.
 
-### 4.2 VPC security-group quota uses the real provider scope
+### 4.2 VPC security-group quota uses the documented regional scope
 
-AWS Service Quotas exposes **`Security groups per VPC`**, not a regional security-group-count quota for this surface. The production VPC is new, so the collector checks:
+Current AWS VPC quota documentation names this adjustable quota **`VPC security groups per Region`**. The collector therefore combines the account-applied quota with a live read-only `DescribeSecurityGroups` count and requires:
 
 ```text
-account-applied Security groups per VPC >= 8
+account-applied VPC security groups per Region
+- current regional security-group count
+>= 8 free security groups
 ```
 
-It does not subtract an account-wide security-group inventory from this per-VPC limit. ENI capacity remains a regional headroom check because that provider quota is regional.
+A default-only quota entry is not accepted where the account-applied value is required. This is intentionally a regional headroom check; a fabricated `Security groups per VPC` quota is not accepted.
 
 ### 4.3 CodeBuild pre-create capability
 
@@ -264,7 +266,7 @@ The report must be green at minimum for the frozen P0 thresholds and the explici
 | RDS capacity | >=2 DB-instance slots and >=200 GiB headroom after existing instances' configured autoscaling ceilings |
 | RDS backup/topology | >=2 free manual DB-snapshot slots; P0 DB-subnet-group hard limit admits two reviewed DB subnets |
 | ALB/VPC | >=1 ALB and >=1 VPC headroom |
-| Security groups | account-applied **Security groups per VPC** >=8 for the new production VPC; no fabricated regional SG quota/inventory subtraction |
+| Security groups | account-applied **VPC security groups per Region** minus current regional `DescribeSecurityGroups` count leaves **>=8 free** |
 | ENI | >=32 free regional network-interface slots |
 | CodeBuild | account-applied Linux/Large concurrency >=1; >=3 project headroom; regional curated Linux Docker capability; frozen `LINUX_CONTAINER + BUILD_GENERAL1_LARGE` mapping and VPC limits |
 | Lambda snapshot coherence | bracket full allocation inventory with account concurrency reads; require two consecutive identical canonical snapshots within three attempts |
@@ -284,12 +286,13 @@ Any failed frozen minimum is a hard provisioning stop. A normal adjustable quota
 
 ## 6. Read-only authority surface
 
-The allowlist contains descriptive/list/get operations only. The compute-race correction adds only read operations:
+The allowlist contains descriptive/list/get operations only. The compute-race and regional-SG corrections add only read operations:
 
 ```text
 EC2:
   DescribeInstances
   DescribeInstanceTypes
+  DescribeSecurityGroups
 
 ECS:
   ListClusters
