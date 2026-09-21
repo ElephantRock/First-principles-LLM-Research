@@ -75,15 +75,30 @@ class _CapacityReservationQuotaAccountingCli:
             if not isinstance(total_raw, int) or total_raw < 0:
                 # Preserve malformed provider evidence for the core fail-closed validator.
                 continue
-            if committed_raw is None:
-                continue
-            if not isinstance(committed_raw, int) or committed_raw < 0:
+            if committed_raw is not None and (
+                not isinstance(committed_raw, int) or committed_raw < 0
+            ):
                 raise AdmissionError(
                     "invalid Capacity Reservation committed instance count: "
                     f"{reservation!r}"
                 )
 
-            quota_instance_count = max(total_raw, committed_raw)
+            # Every reservation in a provider-documented quota-counting state consumes
+            # On-Demand quota. A zero delivered count is therefore not trustworthy proof
+            # of zero quota usage unless commitment metadata supplies the committed count.
+            if total_raw == 0 and committed_raw is None:
+                raise AdmissionError(
+                    "quota-counting Capacity Reservation has zero delivered capacity but "
+                    "no committed instance count; refusing to infer zero quota usage: "
+                    f"{reservation!r}"
+                )
+
+            quota_instance_count = max(total_raw, committed_raw or 0)
+            if quota_instance_count <= 0:
+                raise AdmissionError(
+                    "quota-counting Capacity Reservation has no positive quota claim: "
+                    f"{reservation!r}"
+                )
             if quota_instance_count == total_raw:
                 continue
 
@@ -139,10 +154,10 @@ def collect_bracketed_compute_snapshot(
         try:
             before = _compute_inventory_once(cli, account)
             usage = {
-                "fargateOnDemand": _core.collect_recent_vcpu_usage(
+                "fargateOnDemand": collect_recent_vcpu_usage(
                     cli, "Fargate", "Standard/OnDemand"
                 ),
-                "ec2StandardOnDemand": _core.collect_recent_vcpu_usage(
+                "ec2StandardOnDemand": collect_recent_vcpu_usage(
                     cli, "EC2", "Standard/OnDemand"
                 ),
             }
@@ -179,6 +194,18 @@ def collect_bracketed_compute_snapshot(
     )
 
 
+def _head_blob_sha256(root: Path, relative: Path) -> str | None:
+    """Return SHA-256 of the exact blob at HEAD:path, or None when HEAD lacks the path."""
+    result = _core.subprocess.run(
+        ["git", "-C", str(root), "show", f"HEAD:{relative.as_posix()}"],
+        capture_output=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    return _core.hashlib.sha256(result.stdout).hexdigest()
+
+
 def collector_provenance(require_clean: bool) -> dict[str, Any]:
     """Bind live evidence to both the stable entry point and the reviewed core."""
     core_provenance = _CORE_COLLECTOR_PROVENANCE(require_clean)
@@ -205,26 +232,64 @@ def collector_provenance(require_clean: bool) -> dict[str, Any]:
         timeout=10,
     )
     clean = status.stdout.strip() == "" if status.returncode == 0 else None
+    entrypoint_sha256 = _core.sha256_file(entrypoint)
+    entrypoint_head_sha256 = _head_blob_sha256(root, relative)
+    entrypoint_matches_head = entrypoint_head_sha256 == entrypoint_sha256
+
+    core_relative_raw = core_provenance.get("scriptPath")
+    core_relative = (
+        Path(core_relative_raw)
+        if isinstance(core_relative_raw, str) and core_relative_raw
+        else None
+    )
+    core_head_sha256 = (
+        _head_blob_sha256(root, core_relative) if core_relative is not None else None
+    )
+    core_working_sha256 = core_provenance.get("scriptSha256")
+    core_matches_head = (
+        isinstance(core_working_sha256, str)
+        and core_head_sha256 == core_working_sha256
+    )
+
     if require_clean and clean is not True:
         raise AdmissionError("live evidence collector entrypoint differs from committed Git")
+    if require_clean and not entrypoint_matches_head:
+        raise AdmissionError(
+            "live evidence collector entrypoint is absent from HEAD or its bytes differ from HEAD"
+        )
+    if require_clean and not core_matches_head:
+        raise AdmissionError(
+            "live evidence collector core is absent from HEAD or its bytes differ from HEAD"
+        )
 
     return {
         "gitCommit": core_provenance.get("gitCommit"),
         "scriptPath": str(relative),
-        "scriptSha256": _core.sha256_file(entrypoint),
+        "scriptSha256": entrypoint_sha256,
         "scriptWorkingTreeClean": clean,
+        "scriptHeadSha256": entrypoint_head_sha256,
+        "scriptMatchesHead": entrypoint_matches_head,
         "coreScriptPath": core_provenance.get("scriptPath"),
-        "coreScriptSha256": core_provenance.get("scriptSha256"),
+        "coreScriptSha256": core_working_sha256,
         "coreScriptWorkingTreeClean": core_provenance.get("scriptWorkingTreeClean"),
+        "coreScriptHeadSha256": core_head_sha256,
+        "coreScriptMatchesHead": core_matches_head,
     }
+
+
+def _lambda_concurrency_allocations_hook(cli: Any) -> dict[str, Any]:
+    """Preserve the public wrapper seam while core stable-snapshot logic remains authoritative."""
+    return globals()["collect_lambda_concurrency_allocations"](cli)
 
 
 # core.collect()/core.main() resolve these hooks in the core module at call time. Rebind
 # them before exposing/running main so both direct imports and CLI execution use the
-# corrected accounting and evidence provenance paths.
+# corrected accounting and evidence provenance paths. The Lambda hook preserves the
+# public module seam used by the regression suite without duplicating stable-snapshot logic.
 _core._compute_inventory_once = _compute_inventory_once
 _core.collect_bracketed_compute_snapshot = collect_bracketed_compute_snapshot
 _core.collector_provenance = collector_provenance
+_core.collect_lambda_concurrency_allocations = _lambda_concurrency_allocations_hook
 
 # Ensure corrected public helpers win over the initial re-export.
 globals()["collect_ec2_standard_inventory_once"] = collect_ec2_standard_inventory_once
