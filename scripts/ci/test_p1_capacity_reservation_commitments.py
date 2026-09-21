@@ -5,6 +5,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "ops" / "p1_readonly_admission.py"
 SPEC = importlib.util.spec_from_file_location("p1_readonly_admission_commitment_tests", MODULE_PATH)
@@ -38,7 +39,7 @@ class FakeCli:
 
 class FutureDatedCapacityReservationTests(unittest.TestCase):
     def reservation(self, *, state, total, committed, reservation_type="default"):
-        return {
+        document = {
             "CapacityReservationId": f"cr-{state}",
             "OwnerId": ACCOUNT,
             "State": state,
@@ -46,8 +47,10 @@ class FutureDatedCapacityReservationTests(unittest.TestCase):
             "InstanceType": "m7i.xlarge",
             "TotalInstanceCount": total,
             "AvailableInstanceCount": 0,
-            "CommitmentInfo": {"CommittedInstanceCount": committed},
         }
+        if committed is not None:
+            document["CommitmentInfo"] = {"CommittedInstanceCount": committed}
+        return document
 
     def test_scheduled_commitment_counts_when_total_instance_count_is_zero(self):
         result = p1.collect_ec2_standard_inventory_once(
@@ -69,6 +72,20 @@ class FutureDatedCapacityReservationTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_missing_commitment_cannot_turn_quota_counting_zero_total_into_zero_usage(self):
+        with self.assertRaises(p1.AdmissionError):
+            p1.collect_ec2_standard_inventory_once(
+                FakeCli([self.reservation(state="scheduled", total=0, committed=None)]),
+                ACCOUNT,
+            )
+
+    def test_zero_commitment_cannot_turn_quota_counting_reservation_into_zero_usage(self):
+        with self.assertRaises(p1.AdmissionError):
+            p1.collect_ec2_standard_inventory_once(
+                FakeCli([self.reservation(state="assessing", total=0, committed=0)]),
+                ACCOUNT,
+            )
 
     def test_larger_delivered_total_remains_the_quota_claim(self):
         result = p1.collect_ec2_standard_inventory_once(
@@ -115,8 +132,27 @@ class CollectorProvenanceTests(unittest.TestCase):
         )
         self.assertRegex(provenance["scriptSha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(provenance["coreScriptSha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(provenance["scriptHeadSha256"], provenance["scriptSha256"])
+        self.assertEqual(provenance["coreScriptHeadSha256"], provenance["coreScriptSha256"])
+        self.assertTrue(provenance["scriptMatchesHead"])
+        self.assertTrue(provenance["coreScriptMatchesHead"])
         if provenance.get("gitCommit") is not None:
             self.assertTrue(re.fullmatch(r"[0-9a-f]{40}", provenance["gitCommit"]))
+
+    def test_live_provenance_rejects_entrypoint_absent_from_head(self):
+        with mock.patch.object(p1, "_head_blob_sha256", return_value=None):
+            with self.assertRaises(p1.AdmissionError):
+                p1.collector_provenance(require_clean=True)
+
+    def test_live_provenance_rejects_core_bytes_that_do_not_match_head(self):
+        entrypoint_sha = p1._core.sha256_file(MODULE_PATH)
+        with mock.patch.object(
+            p1,
+            "_head_blob_sha256",
+            side_effect=[entrypoint_sha, "0" * 64],
+        ):
+            with self.assertRaises(p1.AdmissionError):
+                p1.collector_provenance(require_clean=True)
 
 
 if __name__ == "__main__":
