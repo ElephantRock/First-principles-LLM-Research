@@ -29,10 +29,14 @@ MIN_SECURITY_GROUP_HEADROOM = 8
 MIN_ENI_HEADROOM = 32
 MIN_PRIVATE_CONTROL_USABLE_IPV4 = 32
 MIN_RDS_MANUAL_SNAPSHOT_HEADROOM = 2
-VCU_USAGE_WINDOW_MINUTES = 15
+VCPU_USAGE_WINDOW_MINUTES = 15
+VCPU_USAGE_MAX_SAMPLE_AGE_MINUTES = 5
 LAMBDA_SNAPSHOT_MAX_ATTEMPTS = 3
 
 # Frozen provider/hard-limit values recorded by the P0 decision chain.
+CODEBUILD_ENVIRONMENT_TYPE = "LINUX_CONTAINER"
+CODEBUILD_COMPUTE_TYPE = "BUILD_GENERAL1_LARGE"
+CODEBUILD_LINUX_CURATED_PLATFORMS = frozenset({"AMAZON_LINUX", "UBUNTU"})
 CODEBUILD_VPC_SECURITY_GROUP_LIMIT = 5
 CODEBUILD_VPC_SUBNET_LIMIT = 16
 RDS_DB_SUBNET_GROUP_SUBNET_LIMIT = 20
@@ -61,6 +65,7 @@ READ_ONLY_AWS_OPERATIONS = {
     ("rds", "describe-db-instances"),
     ("rds", "describe-db-snapshots"),
     ("codebuild", "list-projects"),
+    ("codebuild", "list-curated-environment-images"),
     ("lambda", "get-account-settings"),
     ("lambda", "list-functions"),
     ("lambda", "get-function-concurrency"),
@@ -249,6 +254,7 @@ def evaluate(
     quotas = observed.get("quotas") or {}
     usage = observed.get("usage") or {}
     vcpu_usage = observed.get("vcpuUsage") or {}
+    codebuild_capability = observed.get("codebuildEnvironmentCapability") or {}
     lambda_settings = observed.get("lambdaAccountSettings") or {}
     lambda_allocations = observed.get("lambdaConcurrencyAllocations") or {}
     enabled_azs = set(observed.get("enabledAvailabilityZones") or [])
@@ -281,9 +287,13 @@ def evaluate(
         return quota_value(quotas[service], *names, require_applied=True)
 
     fargate = applied("fargate", "Fargate On-Demand vCPU resource count")
-    fargate_usage = (vcpu_usage.get("fargateOnDemand") or {}).get("maximumObservedVcpu")
+    fargate_usage_evidence = vcpu_usage.get("fargateOnDemand") or {}
+    fargate_usage = fargate_usage_evidence.get("maximumObservedVcpu")
     fargate_headroom = (
-        fargate - float(fargate_usage) if isinstance(fargate_usage, (int, float)) else None
+        fargate - float(fargate_usage)
+        if fargate_usage_evidence.get("telemetryComplete") is True
+        and isinstance(fargate_usage, (int, float))
+        else None
     )
     add(
         "quota.fargate-ondemand-vcpu-headroom",
@@ -292,15 +302,21 @@ def evaluate(
             "appliedQuotaVcpu": fargate,
             "recentMaximumUsageVcpu": fargate_usage,
             "headroomVcpu": fargate_headroom,
-            "usageEvidence": vcpu_usage.get("fargateOnDemand"),
+            "usageEvidence": fargate_usage_evidence,
         },
-        ">= 6 free vCPU after existing Fargate On-Demand usage",
-        "The frozen six-vCPU admission minimum is required as remaining regional headroom, not merely as a nominal quota value.",
+        ">= 6 free vCPU after existing Fargate On-Demand usage, based on recent complete telemetry",
+        "Unknown, empty, or stale usage telemetry fails closed; the frozen six-vCPU minimum is remaining regional headroom, not nominal quota.",
     )
 
     ec2 = applied("ec2", "Running On-Demand Standard")
-    ec2_usage = (vcpu_usage.get("ec2StandardOnDemand") or {}).get("maximumObservedVcpu")
-    ec2_headroom = ec2 - float(ec2_usage) if isinstance(ec2_usage, (int, float)) else None
+    ec2_usage_evidence = vcpu_usage.get("ec2StandardOnDemand") or {}
+    ec2_usage = ec2_usage_evidence.get("maximumObservedVcpu")
+    ec2_headroom = (
+        ec2 - float(ec2_usage)
+        if ec2_usage_evidence.get("telemetryComplete") is True
+        and isinstance(ec2_usage, (int, float))
+        else None
+    )
     add(
         "quota.ec2-standard-ondemand-vcpu-headroom",
         ec2_headroom is not None and ec2_headroom >= 4,
@@ -308,10 +324,10 @@ def evaluate(
             "appliedQuotaVcpu": ec2,
             "recentMaximumUsageVcpu": ec2_usage,
             "headroomVcpu": ec2_headroom,
-            "usageEvidence": vcpu_usage.get("ec2StandardOnDemand"),
+            "usageEvidence": ec2_usage_evidence,
         },
-        ">= 4 free Standard On-Demand vCPU after existing usage",
-        "One m7i.xlarge worker requires four remaining Standard On-Demand vCPUs.",
+        ">= 4 free Standard On-Demand vCPU after existing usage, based on recent complete telemetry",
+        "Unknown, empty, or stale usage telemetry fails closed; one m7i.xlarge worker requires four remaining Standard On-Demand vCPUs.",
     )
 
     alb_quota = applied("elasticloadbalancing", "Application Load Balancers per Region")
@@ -347,6 +363,30 @@ def evaluate(
     codebuild_projects = applied("codebuild", "Build projects")
     project_count = int(usage.get("codebuildProjects", -1))
     add("quota.codebuild-project-headroom", project_count >= 0 and codebuild_projects - project_count >= 3, {"quota": codebuild_projects, "current": project_count}, ">= 3 free projects", "Three protected CodeBuild projects are required.")
+
+    codebuild_linux_images = codebuild_capability.get("curatedLinuxDockerImageCount")
+    add(
+        "availability.codebuild-linux-large-environment",
+        codebuild_concurrency >= 1
+        and codebuild_capability.get("regionalApiReadSucceeded") is True
+        and isinstance(codebuild_linux_images, int)
+        and codebuild_linux_images > 0
+        and CODEBUILD_ENVIRONMENT_TYPE == "LINUX_CONTAINER"
+        and CODEBUILD_COMPUTE_TYPE == "BUILD_GENERAL1_LARGE",
+        {
+            "appliedLinuxLargeConcurrency": codebuild_concurrency,
+            "environmentType": CODEBUILD_ENVIRONMENT_TYPE,
+            "computeType": CODEBUILD_COMPUTE_TYPE,
+            "regionalCapability": codebuild_capability,
+        },
+        {
+            "appliedLinuxLargeConcurrency": ">= 1",
+            "environmentType": "LINUX_CONTAINER",
+            "computeType": "BUILD_GENERAL1_LARGE",
+            "regionalCodeBuildRead": "successful with >=1 Linux curated Docker image",
+        },
+        "R19 requires the selected Linux/Large container environment to be usable in eu-west-1; the live regional CodeBuild catalog is combined with the account-applied Linux/Large slot and P0-frozen provider mapping. Actual protected project/build execution remains post-create proof.",
+    )
 
     add(
         "provider.codebuild-vpc-hard-limits",
@@ -608,9 +648,21 @@ class AwsCli:
         raise AdmissionError(f"ECS Express regional read probe returned an unclassified error: {combined[-1200:]}")
 
 
+def _parse_cloudwatch_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise AdmissionError(f"AWS/Usage datapoint is missing a timestamp: {value!r}")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise AdmissionError(f"invalid AWS/Usage datapoint timestamp: {value!r}") from exc
+    if parsed.tzinfo is None:
+        raise AdmissionError(f"AWS/Usage datapoint timestamp is not timezone-aware: {value!r}")
+    return parsed.astimezone(timezone.utc)
+
+
 def collect_recent_vcpu_usage(cli: AwsCli, service: str, resource_class: str) -> dict[str, Any]:
     end = datetime.now(timezone.utc).replace(microsecond=0)
-    start = end - timedelta(minutes=VCU_USAGE_WINDOW_MINUTES)
+    start = end - timedelta(minutes=VCPU_USAGE_WINDOW_MINUTES)
     dimensions = [
         f"Name=Service,Value={service}",
         "Name=Type,Value=Resource",
@@ -638,13 +690,26 @@ def collect_recent_vcpu_usage(cli: AwsCli, service: str, resource_class: str) ->
     datapoints = doc.get("Datapoints")
     if not isinstance(datapoints, list):
         raise AdmissionError(f"CloudWatch AWS/Usage response missing Datapoints for {service}/{resource_class}")
+
     values: list[float] = []
+    timestamps: list[datetime] = []
     for point in datapoints:
+        if not isinstance(point, dict):
+            raise AdmissionError(f"invalid AWS/Usage datapoint for {service}/{resource_class}: {point!r}")
         value = point.get("Maximum")
         if not isinstance(value, (int, float)) or float(value) < 0:
             raise AdmissionError(f"invalid AWS/Usage ResourceCount datapoint for {service}/{resource_class}: {point!r}")
         values.append(float(value))
-    maximum = max(values) if values else 0.0
+        timestamps.append(_parse_cloudwatch_timestamp(point.get("Timestamp")))
+
+    latest = max(timestamps) if timestamps else None
+    latest_age_seconds = (end - latest).total_seconds() if latest is not None else None
+    telemetry_complete = (
+        latest is not None
+        and latest <= end + timedelta(minutes=1)
+        and latest >= end - timedelta(minutes=VCPU_USAGE_MAX_SAMPLE_AGE_MINUTES)
+    )
+    maximum = max(values) if telemetry_complete else None
     return {
         "namespace": "AWS/Usage",
         "metricName": "ResourceCount",
@@ -659,9 +724,67 @@ def collect_recent_vcpu_usage(cli: AwsCli, service: str, resource_class: str) ->
         "periodSeconds": 60,
         "statistic": "Maximum",
         "datapointCount": len(datapoints),
+        "latestDatapointAt": latest.isoformat().replace("+00:00", "Z") if latest is not None else None,
+        "latestDatapointAgeSeconds": latest_age_seconds,
         "maximumObservedVcpu": maximum,
-        "emptyWindowInterpretedAsZeroUsage": len(datapoints) == 0,
+        "telemetryComplete": telemetry_complete,
+        "emptyWindow": len(datapoints) == 0,
+        "maxAcceptedSampleAgeMinutes": VCPU_USAGE_MAX_SAMPLE_AGE_MINUTES,
         "datapoints": datapoints,
+    }
+
+
+def summarize_codebuild_environment_capability(doc: dict[str, Any]) -> dict[str, Any]:
+    platforms = doc.get("platforms")
+    if not isinstance(platforms, list):
+        raise AdmissionError("CodeBuild curated-environment response is missing platforms")
+
+    linux_platforms: list[str] = []
+    image_count = 0
+    version_count = 0
+    for platform in platforms:
+        if not isinstance(platform, dict):
+            raise AdmissionError(f"invalid CodeBuild curated platform: {platform!r}")
+        platform_name = platform.get("platform")
+        if platform_name not in CODEBUILD_LINUX_CURATED_PLATFORMS:
+            continue
+        languages = platform.get("languages")
+        if not isinstance(languages, list):
+            raise AdmissionError(f"CodeBuild curated Linux platform missing languages: {platform_name!r}")
+        platform_image_count = 0
+        for language in languages:
+            if not isinstance(language, dict):
+                raise AdmissionError(f"invalid CodeBuild curated language: {language!r}")
+            images = language.get("images")
+            if not isinstance(images, list):
+                raise AdmissionError(
+                    f"CodeBuild curated language missing images on {platform_name!r}: {language!r}"
+                )
+            for image in images:
+                if not isinstance(image, dict) or not isinstance(image.get("name"), str) or not image.get("name"):
+                    raise AdmissionError(f"invalid CodeBuild curated image on {platform_name!r}: {image!r}")
+                platform_image_count += 1
+                versions = image.get("versions")
+                if not isinstance(versions, list):
+                    raise AdmissionError(f"CodeBuild curated image missing versions: {image!r}")
+                version_count += len(versions)
+        if platform_image_count > 0:
+            linux_platforms.append(str(platform_name))
+            image_count += platform_image_count
+
+    return {
+        "regionalApiReadSucceeded": True,
+        "environmentType": CODEBUILD_ENVIRONMENT_TYPE,
+        "computeType": CODEBUILD_COMPUTE_TYPE,
+        "linuxCuratedPlatforms": sorted(linux_platforms),
+        "curatedLinuxDockerImageCount": image_count,
+        "curatedLinuxImageVersionCount": version_count,
+        "p0ProviderMapping": {
+            "environmentType": CODEBUILD_ENVIRONMENT_TYPE,
+            "computeType": CODEBUILD_COMPUTE_TYPE,
+            "vpcSecurityGroupsMax": CODEBUILD_VPC_SECURITY_GROUP_LIMIT,
+            "vpcSubnetsMax": CODEBUILD_VPC_SUBNET_LIMIT,
+        },
     }
 
 
@@ -895,6 +1018,9 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
         "fargateOnDemand": collect_recent_vcpu_usage(cli, "Fargate", "Standard/OnDemand"),
         "ec2StandardOnDemand": collect_recent_vcpu_usage(cli, "EC2", "Standard/OnDemand"),
     }
+    codebuild_environment_capability = summarize_codebuild_environment_capability(
+        cli.run_json("codebuild", "list-curated-environment-images")
+    )
     vpcs = cli.run_json("ec2", "describe-vpcs")
     enis = cli.run_json("ec2", "describe-network-interfaces")
     sgs = cli.run_json("ec2", "describe-security-groups")
@@ -925,6 +1051,7 @@ def collect(cli: AwsCli, require_kms_endpoint: bool) -> dict[str, Any]:
         "endpointServices": endpoint_doc.get("ServiceNames") or [],
         "ecsExpress": express_probe,
         "vcpuUsage": vcpu_usage,
+        "codebuildEnvironmentCapability": codebuild_environment_capability,
         "quotas": {
             code: service_quotas(cli, code)
             for code in ("fargate", "ec2", "rds", "elasticloadbalancing", "vpc", "codebuild", "dynamodb")
@@ -963,6 +1090,7 @@ def build_evidence_boundary(evidence_source: str, summary_status: str) -> dict[s
             "real subnet available-IP counts and Lambda/CodeBuild ENI attachment",
             "real VPC endpoint policies and route-table associations",
             "DynamoDB tables use PAY_PER_REQUEST and no table maximum is below the frozen release-control requirement",
+            "real protected CodeBuild projects execute the frozen private-VPC/Docker configuration on LINUX_CONTAINER + BUILD_GENERAL1_LARGE",
         ],
     }
 
