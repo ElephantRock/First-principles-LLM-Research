@@ -32,6 +32,8 @@ for _name in dir(_core):
 
 _CORE_COLLECT_EC2_STANDARD_INVENTORY_ONCE = _core.collect_ec2_standard_inventory_once
 _CORE_COLLECTOR_PROVENANCE = _core.collector_provenance
+_CORE_COLLECT_RECENT_VCPU_USAGE = _core.collect_recent_vcpu_usage
+_CORE_COLLECT_LAMBDA_CONCURRENCY_ALLOCATIONS = _core.collect_lambda_concurrency_allocations
 
 
 class _CapacityReservationQuotaAccountingCli:
@@ -140,6 +142,14 @@ def _compute_inventory_once(cli: Any, account: str) -> dict[str, Any]:
         "fargateOnDemand": _core.collect_fargate_inventory_once(cli),
         "ec2StandardOnDemand": collect_ec2_standard_inventory_once(cli, account),
     }
+
+
+def _recent_vcpu_usage_hook(cli: Any, service: str, resource_class: str) -> dict[str, Any]:
+    """Preserve both wrapper- and core-level regression seams after the module split."""
+    wrapper_callable = globals().get("collect_recent_vcpu_usage")
+    if wrapper_callable is not _CORE_COLLECT_RECENT_VCPU_USAGE:
+        return wrapper_callable(cli, service, resource_class)
+    return _CORE_COLLECT_RECENT_VCPU_USAGE(cli, service, resource_class)
 
 
 def collect_bracketed_compute_snapshot(
@@ -277,12 +287,22 @@ def collector_provenance(require_clean: bool) -> dict[str, Any]:
     }
 
 
+def _lambda_concurrency_allocations_hook(cli: Any) -> dict[str, Any]:
+    """Preserve both wrapper- and core-level regression seams after the module split."""
+    wrapper_callable = globals().get("collect_lambda_concurrency_allocations")
+    if wrapper_callable is not _CORE_COLLECT_LAMBDA_CONCURRENCY_ALLOCATIONS:
+        return wrapper_callable(cli)
+    return _CORE_COLLECT_LAMBDA_CONCURRENCY_ALLOCATIONS(cli)
+
+
 # core.collect()/core.main() resolve these hooks in the core module at call time. Rebind
-# them before exposing/running main so both direct imports and CLI execution use the
-# corrected accounting and evidence provenance paths.
+# them before exposing/running main so direct imports and CLI execution use the corrected
+# accounting/provenance paths while tests can patch either the wrapper or core seam.
 _core._compute_inventory_once = _compute_inventory_once
+_core.collect_recent_vcpu_usage = _recent_vcpu_usage_hook
 _core.collect_bracketed_compute_snapshot = collect_bracketed_compute_snapshot
 _core.collector_provenance = collector_provenance
+_core.collect_lambda_concurrency_allocations = _lambda_concurrency_allocations_hook
 
 # Ensure corrected public helpers win over the initial re-export.
 globals()["collect_ec2_standard_inventory_once"] = collect_ec2_standard_inventory_once
