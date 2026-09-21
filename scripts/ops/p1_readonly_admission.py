@@ -4,10 +4,10 @@ from __future__ import annotations
 
 The collector grew large during the P1 hardening cycle. The reviewed implementation is
 kept in ``p1_readonly_admission_core.py``; this entry point re-exports that surface and
-contains the narrowly scoped quota-accounting correction that requires future-dated EC2
-Capacity Reservation commitments to be counted even while ``TotalInstanceCount`` remains
-zero. Live collection still enters the core ``main`` function, with its compute snapshot
-and provenance hooks replaced below before execution.
+contains narrowly scoped EC2 quota-accounting corrections for future-dated Capacity
+Reservation commitments and Capacity Block instance exclusion. Live collection still
+enters the core ``main`` function, with its compute snapshot and provenance hooks replaced
+below before execution.
 """
 
 import copy
@@ -37,22 +37,59 @@ _CORE_COLLECT_LAMBDA_CONCURRENCY_ALLOCATIONS = _core.collect_lambda_concurrency_
 
 
 class _CapacityReservationQuotaAccountingCli:
-    """Read-only response adapter for AWS future-dated reservation quota semantics.
+    """Read-only response adapter for EC2 Standard On-Demand quota semantics.
 
     AWS documents ``assessing``, ``scheduled``, ``pending``, ``active`` and ``delayed``
     On-Demand Capacity Reservations as consuming the owner's On-Demand Instance quota.
     For a future-dated reservation, ``TotalInstanceCount`` can remain zero while the
-    committed capacity is carried in ``CommitmentInfo.CommittedInstanceCount``. The core
-    inventory already handles reservation/instance double-counting; this adapter only
-    normalizes the count presented to that reviewed logic to the larger provider claim.
+    committed capacity is carried in ``CommitmentInfo.CommittedInstanceCount``.
+
+    AWS separately documents Capacity Block instances as outside On-Demand Instance limits
+    and exposes them with ``InstanceLifecycle=capacity-block``. The reviewed core already
+    excludes Capacity Block reservations; this adapter also removes their running instances
+    before the core computes Standard On-Demand vCPU usage while retaining exclusion evidence.
     """
 
     def __init__(self, delegate: Any) -> None:
         self.delegate = delegate
         self.commitment_adjustments: list[dict[str, Any]] = []
+        self.capacity_block_instance_exclusions: list[dict[str, Any]] = []
 
     def run_json(self, service: str, operation: str, *args: str) -> dict[str, Any]:
         document = self.delegate.run_json(service, operation, *args)
+
+        if (service, operation) == ("ec2", "describe-instances"):
+            adjusted = copy.deepcopy(document)
+            launch_reservations = adjusted.get("Reservations")
+            if not isinstance(launch_reservations, list):
+                # Preserve malformed provider evidence for the core fail-closed validator.
+                return adjusted
+            for launch_reservation in launch_reservations:
+                if not isinstance(launch_reservation, dict):
+                    continue
+                instances = launch_reservation.get("Instances")
+                if not isinstance(instances, list):
+                    continue
+                retained: list[Any] = []
+                for instance in instances:
+                    if (
+                        isinstance(instance, dict)
+                        and instance.get("InstanceLifecycle") == "capacity-block"
+                    ):
+                        self.capacity_block_instance_exclusions.append(
+                            {
+                                "instanceId": instance.get("InstanceId"),
+                                "instanceType": instance.get("InstanceType"),
+                                "capacityReservationId": instance.get("CapacityReservationId"),
+                                "capacityBlockId": instance.get("CapacityBlockId"),
+                                "instanceLifecycle": "capacity-block",
+                            }
+                        )
+                        continue
+                    retained.append(instance)
+                launch_reservation["Instances"] = retained
+            return adjusted
+
         if (service, operation) != ("ec2", "describe-capacity-reservations"):
             return document
 
@@ -134,6 +171,11 @@ def collect_ec2_standard_inventory_once(cli: Any, account: str) -> dict[str, Any
             "for provider-documented quota-counting On-Demand Capacity Reservation states"
         ),
         "futureDatedCommitmentAdjustments": adapter.commitment_adjustments,
+        "capacityBlockInstanceAccounting": (
+            "instances with InstanceLifecycle=capacity-block are excluded from Standard "
+            "On-Demand vCPU usage"
+        ),
+        "capacityBlockInstanceExclusions": adapter.capacity_block_instance_exclusions,
     }
 
 
